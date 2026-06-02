@@ -1,0 +1,17 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-dotenv==1.0.1
+httpx==0.28.1
+pydantic==2.10.4
+langgraph==0.2.60
+langchain-core==0.3.28
+lancedb==0.17.0
+numpy==2.2.1
+pyarrow==18.1.0
+celery[redis]==5.4.0
+redis==5.2.1
+apscheduler==3.10.4
+pyjwt==2.10.1
+cryptography==44.0.0
+python-multipart==0.0.18
+pymupdf==1.25.3
