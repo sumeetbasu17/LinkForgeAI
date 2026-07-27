@@ -132,11 +132,33 @@ function StyleTab({config,toast}){
   const [postText,setPostText]=useState('');const [postType,setPostType]=useState('own');const [postCat,setPostCat]=useState('');
   const [stylePosts,setStylePosts]=useState([]);const [counts,setCounts]=useState(null);
   const [profile,setProfile]=useState(null);const [analyzing,setAnalyzing]=useState(false);
-  const [viewCat,setViewCat]=useState('');const [viewType,setViewType]=useState('');const [uploading,setUploading]=useState(false);const [recategorizing,setRecategorizing]=useState(false);
+  const [viewCat,setViewCat]=useState('');const [viewType,setViewType]=useState('');const [uploading,setUploading]=useState(false);const [recategorizing,setRecategorizing]=useState(false);const [adding,setAdding]=useState(false);
   const fileRef=useRef(null);const categories=config?.categories||[];
   const fetch_=useCallback(async()=>{try{const [p,pr,c]=await Promise.all([api.listStylePosts(viewType||viewCat?{...(viewType?{post_type:viewType}:{}),  ...(viewCat?{category:viewCat}:{})}:{}),api.getStyleProfile(),api.getStyleCounts()]);setStylePosts(p.posts||[]);setProfile(pr);setCounts(c)}catch{}},[viewCat,viewType]);
   useEffect(()=>{fetch_()},[fetch_]);
-  const addPost=async()=>{if(!postText.trim()){toast('Enter content','error');return}try{const r=await api.addStylePost({content:postText,post_type:postType,category:postCat});toast(r.message||'Added!');setPostText('');fetch_()}catch(e){toast(e.message,'error')}};
+  // A paste can hold one post or twenty. Preview the split, then ask — pasting
+  // ten articles used to silently store them as a single style post.
+  const addPost=async()=>{
+    const text=postText.trim();
+    if(!text){toast('Enter content','error');return}
+    setAdding(true);
+    try{
+      const prev=await api.previewStyleSplit(text).catch(()=>null);
+      const parts=prev?.articles||[];
+      if(parts.length>1){
+        const list=parts.slice(0,5).map((a,i)=>`${i+1}. ${a.preview.replace(/\s+/g,' ').slice(0,60)}…`).join('\n');
+        const more=parts.length>5?`\n…and ${parts.length-5} more`:'';
+        const gaps=prev.numbering_gaps?.length?`\nNumbering gap at ${prev.numbering_gaps.join(', ')}.`:'';
+        const ok=confirm(`Detected ${parts.length} separate posts (split by "${prev.method}").${gaps}\n\n${list}${more}\n\nOK — add all ${parts.length} separately\nCancel — keep as one post`);
+        if(ok){
+          const r=await api.addStylePostsBulk({contents:parts.map(a=>a.content),post_type:postType,category:postCat});
+          toast(r.message||`${r.added} posts added`);setPostText('');fetch_();return;
+        }
+      }
+      const r=await api.addStylePost({content:text,post_type:postType,category:postCat});
+      toast(r.message||'Added!');setPostText('');fetch_();
+    }catch(e){toast(e.message,'error')}finally{setAdding(false)}
+  };
   const handleFile=async e=>{const file=e.target.files?.[0];if(!file)return;setUploading(true);try{const r=await api.uploadStyleFile(file,postType,postCat);toast(r.message||`${r.added} imported!`);fetch_()}catch(e){toast(e.message,'error')}finally{setUploading(false);if(fileRef.current)fileRef.current.value=''}};
   const deleteCat=async cat=>{if(!confirm(`Delete all posts in "${cat||'uncategorized'}"?`))return;try{await api.deleteStylePostsBulk({category:cat,...(viewType?{post_type:viewType}:{})});toast('Deleted!');fetch_()}catch(e){toast(e.message,'error')}};
   const deleteAll=async()=>{if(!confirm('Delete ALL style posts?'))return;try{await api.deleteStylePostsBulk({delete_all:'true'});toast('All deleted');fetch_()}catch(e){toast(e.message,'error')}};
@@ -152,8 +174,8 @@ function StyleTab({config,toast}){
         <label style={{...S.label,marginTop:'8px'}}>Category</label>
         <div style={{display:'flex',flexWrap:'wrap',gap:'6px',marginBottom:'12px'}}><span style={S.tag(!postCat,'#71717A')} onClick={()=>setPostCat('')}>🔍 Auto-detect</span>{categories.map(c=><span key={c.id} style={S.tag(postCat===c.id)} onClick={()=>setPostCat(c.id)}>{c.icon} {c.label}</span>)}</div>
         <textarea style={S.textarea} placeholder={postType==='comment'?'Paste your LinkedIn comments...':postType==='inspiration'?'Paste a post you admire...':'Paste your LinkedIn post...'} value={postText} onChange={e=>setPostText(e.target.value)}/>
-        <div style={{display:'flex',gap:'8px',marginTop:'10px'}}><button style={{...S.btn('ghost'),flex:1,justifyContent:'center'}} onClick={addPost}>+ Add</button><button style={{...S.btn('ghost'),justifyContent:'center',opacity:uploading?0.7:1}} onClick={()=>fileRef.current?.click()} disabled={uploading}>{uploading?'⏳...':'📁 Upload file'}</button><input ref={fileRef} type="file" accept=".txt,.csv,.json,.pdf" style={{display:'none'}} onChange={handleFile}/></div>
-        <div style={{fontSize:'11px',color:'var(--text-dim)',marginTop:'6px'}}>Accepts .txt, .csv, .json, .pdf — split on "Article 1 :" headers, --- separators, post links, or blank lines. Articles spanning several pages stay in one piece.</div>
+        <div style={{display:'flex',gap:'8px',marginTop:'10px'}}><button style={{...S.btn('ghost'),flex:1,justifyContent:'center',opacity:adding?0.7:1}} onClick={addPost} disabled={adding}>{adding?'⏳...':'+ Add'}</button><button style={{...S.btn('ghost'),justifyContent:'center',opacity:uploading?0.7:1}} onClick={()=>fileRef.current?.click()} disabled={uploading}>{uploading?'⏳...':'📁 Upload file'}</button><input ref={fileRef} type="file" accept=".txt,.csv,.json,.pdf" style={{display:'none'}} onChange={handleFile}/></div>
+        <div style={{fontSize:'11px',color:'var(--text-dim)',marginTop:'6px'}}>Paste one post or many — several are detected and confirmed before saving. Files: .txt, .csv, .json, .pdf — split on "Article 1 — Title" headers (any separator), repeated "Post N" headings, --- separators, post links, or blank lines. Articles spanning several pages stay in one piece.</div>
       </div>
       <div style={S.card}><label style={S.label}>Uploaded content</label>
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:'10px'}}>{[{l:'My posts',v:totalOwn,c:'#6366F1'},{l:'Inspiration',v:totalInsp,c:'#F59E0B'},{l:'Comments',v:totalComment,c:'#10B981'}].map((s,i)=><div key={i} style={{textAlign:'center',padding:'12px',borderRadius:'10px',background:'var(--bg-input)'}}><div style={{fontSize:'22px',fontWeight:700,color:s.c}}>{s.v}</div><div style={{fontSize:'11px',color:'var(--text-dim)',marginTop:'2px'}}>{s.l}</div></div>)}</div>

@@ -37,6 +37,8 @@ const api = {
 
   // Style
   addStylePost: (d) => request('/style/posts', { method: 'POST', body: d }),
+  previewStyleSplit: (content) => request('/style/preview', { method: 'POST', body: { content } }),
+  addStylePostsBulk: (d) => request('/style/posts/bulk', { method: 'POST', body: d }),
   listStylePosts: (p = {}) => { const q = new URLSearchParams(p).toString(); return request(`/style/posts${q ? '?' + q : ''}`); },
   getStyleCounts: (uid = 'default') => request(`/style/counts?user_id=${uid}`),
   deleteStylePost: (id) => request(`/style/posts/${id}`, { method: 'DELETE' }),

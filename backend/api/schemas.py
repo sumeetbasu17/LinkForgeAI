@@ -81,6 +81,20 @@ class AddStylePostRequest(BaseModel):
     user_id: str = Field("default")
 
 
+class SplitPreviewRequest(BaseModel):
+    content: str = Field(..., description="Pasted text that may hold several posts")
+
+
+class AddStylePostsBulkRequest(BaseModel):
+    """Add several style posts at once, e.g. after splitting a paste."""
+
+    contents: list[str] = Field(..., description="One entry per post")
+    post_type: str = Field("own", description="'own', 'inspiration' or 'comment'")
+    category: str = Field("", description="Blank means auto-detect per post")
+    source_url: str = Field("", description="Optional source URL")
+    user_id: str = Field("default")
+
+
 class StylePostResponse(BaseModel):
     id: str
     content: str

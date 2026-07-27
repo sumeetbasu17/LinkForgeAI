@@ -12,6 +12,13 @@ Design notes
 * Article headers are matched typo-tolerantly ("Artcle 11 :", "Artcile 13 :",
   "Arctle 21 :" all appear in real exports) but with strict guards so that
   in-body lines like "Option 1: @Order" are never treated as boundaries.
+  The separator between the number and the title is free-form: ":", "-", "—",
+  "|", a plain space, or nothing. Markdown prefixes ("# Article 1 — Title")
+  are stripped. An earlier version only accepted ":.)-", so files written
+  with an em dash collapsed into a single article.
+* Files with no "Article" keyword can still be split on a repeated "Word N"
+  heading ("Post 3 —", "Lesson 4:"), guarded against numbered lists and
+  step-by-step tutorials inside one post.
 * Chunking granularity is one article = one chunk. LinkedIn posts are short
   (100-400 words) and style is a whole-document property, so splitting them
   further would hand the generator half-examples to imitate.
@@ -30,14 +37,23 @@ MIN_ARTICLE_CHARS = 60
 # Header token variants are matched by similarity rather than a fixed list.
 _HEADER_WORD = "article"
 _HEADER_SIMILARITY = 0.72
-_MAX_HEADER_LINE = 80
+_MAX_HEADER_LINE = 120
 _MAX_ARTICLE_NUMBER = 999
 
 # Line that is only a ligature artifact left behind by some PDF extractors.
 _LIGATURE_JUNK = re.compile(r"^(f[filjt]{0,2}|ﬀ|ﬁ|ﬂ|ﬃ|ﬄ)$", re.IGNORECASE)
 
+# "Article 1 : Title", "## Article 1 — Title", "Artcle 13 - Title", "Article 7".
+# The separator between the number and the title may be punctuation of any kind
+# (people type en dashes, em dashes, pipes and bullets), plain whitespace, or
+# nothing at all when the header carries no title.
 _HEADER_LINE = re.compile(
-    r"^\s*([A-Za-z]{4,10})\s*[-–—]?\s*(\d{1,3})\s*[:.)-]\s*(.*)$"
+    r"^\s*(?:#{1,6}\s*)?(?:\*{1,2}\s*)?"          # markdown heading / bold prefix
+    r"([A-Za-z]{4,10})"                            # "Article" or a typo variant
+    r"\s*[-–—]?\s*"                                # optional dash before the number
+    r"(\d{1,3})"                                   # the article number
+    r"(?:\s*[:.)\]}\-–—|~•]+\s*|\s+|\s*$)"         # separator, space, or line end
+    r"(.*?)\s*\**\s*$"                             # title text, trailing ** trimmed
 )
 
 _URL_CONTINUATION = re.compile(r"^[\w\-./?&=%#~+:;,@]+$")
@@ -323,6 +339,90 @@ def is_header_line(line: str) -> bool:
     return parse_header_line(line) is not None
 
 
+# Words that enumerate steps *inside* a post rather than separating posts.
+# "Step 1 ... Step 2 ..." is a tutorial, not two articles.
+_IN_POST_ENUMERATORS = {
+    "step", "option", "point", "phase", "level", "rule", "tip", "question",
+    "answer", "example", "note", "version", "reason", "myth", "mistake",
+    "problem", "solution", "layer", "stage", "round", "fix",
+}
+
+# Minimum average chunk size before a repeated "Word N" heading is trusted as
+# an article boundary. Enumerated steps are short; whole posts are not.
+_MIN_AVG_HEADING_CHUNK = 200
+
+_GENERIC_HEADING = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:\*{1,2}\s*)?"
+    r"([A-Za-z]{3,12})"
+    r"\s*[-–—]?\s*"
+    r"(\d{1,3})"
+    r"(?:\s*[:.)\]}\-–—|~•]+\s*|\s+|\s*$)"
+    r"(.*?)\s*\**\s*$"
+)
+
+
+def find_numbered_headings(text: str) -> list[tuple[int, int, str]]:
+    """Locate repeated "Word N" headings used as article boundaries.
+
+    Catches files labelled "Post 1 —", "Lesson 4:", "Entry 7" that carry no
+    literal "Article" keyword. Deliberately strict:
+
+    * the same word must repeat across every heading
+    * the numbers must ascend
+    * each heading must start a paragraph (blank line before it)
+    * enumerator words that appear *inside* a post ("Step 2") are rejected
+
+    A bare numbered list ("1. Quantize the model") has no leading word, so it
+    can never match.
+
+    Returns a list of (line_index, number, trailing_text_on_that_line).
+    """
+    lines = text.split("\n")
+    candidates: dict[str, list[tuple[int, int, str]]] = {}
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or len(stripped) > _MAX_HEADER_LINE:
+            continue
+        # Must start a paragraph, otherwise it is a sentence inside a post.
+        if idx > 0 and lines[idx - 1].strip():
+            continue
+        match = _GENERIC_HEADING.match(line)
+        if not match:
+            continue
+        word = match.group(1).lower()
+        if word in _IN_POST_ENUMERATORS:
+            continue
+        num = int(match.group(2))
+        if num < 1 or num > _MAX_ARTICLE_NUMBER:
+            continue
+        candidates.setdefault(word, []).append((idx, num, match.group(3).strip()))
+
+    if not candidates:
+        return []
+
+    # The most-repeated word wins; ties go to the one that appears first.
+    word = max(candidates, key=lambda w: (len(candidates[w]), -candidates[w][0][0]))
+    headings = candidates[word]
+    if len(headings) < 2:
+        return []
+
+    ascending: list[tuple[int, int, str]] = []
+    highest = 0
+    for heading in headings:
+        if not ascending or heading[1] > highest:
+            ascending.append(heading)
+            highest = heading[1]
+    if len(ascending) < 2:
+        return []
+
+    # Reject enumerations that are too tightly packed to be whole posts.
+    span = len(text) - sum(len(lines[i]) for i, _, _ in ascending)
+    if span / len(ascending) < _MIN_AVG_HEADING_CHUNK:
+        return []
+    return ascending
+
+
 def find_article_headers(text: str) -> list[tuple[int, int, str]]:
     """Locate article headers.
 
@@ -389,8 +489,9 @@ def split_into_articles(text: str) -> dict:
       1. Explicit "Article N :" headers (typo tolerant)
       2. Horizontal-rule separators (--- / ___ / ===)
       3. Post URL as a terminator (each article ends with its LinkedIn link)
-      4. Three or more consecutive blank lines
-      5. The whole document as a single article
+      4. Repeated "Word N" headings at paragraph starts ("Post 3 —", "Lesson 4:")
+      5. Three or more consecutive blank lines
+      6. The whole document as a single article
 
     Returns {"articles": [...], "method": str, "skipped": int, "gaps": [int]}
     """
@@ -400,13 +501,20 @@ def split_into_articles(text: str) -> dict:
 
     lines = text.split("\n")
     headers = find_article_headers(text)
+    method = ""
+    if headers:
+        method = "article-headers"
+    elif not re.search(r"^\s*([-_=]{3,})\s*$", text, flags=re.MULTILINE) and (
+        len(re.findall(r"https?://(?:www\.)?linkedin\.com/\S+", text)) < 2
+    ):
+        headers = find_numbered_headings(text)
+        if headers:
+            method = "numbered-headings"
 
     articles: list[dict] = []
     skipped = 0
-    method = ""
 
     if headers:
-        method = "article-headers"
         for pos, (line_idx, number, trailing) in enumerate(headers):
             end = headers[pos + 1][0] if pos + 1 < len(headers) else len(lines)
             body_lines = ([trailing] if trailing else []) + lines[line_idx + 1 : end]

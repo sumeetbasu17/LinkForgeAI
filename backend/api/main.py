@@ -32,6 +32,8 @@ from api.schemas import (
     PostUpdate,
     PostResponse,
     AddStylePostRequest,
+    AddStylePostsBulkRequest,
+    SplitPreviewRequest,
     StylePostResponse,
     PreferencesUpdate,
     PreferencesResponse,
@@ -269,6 +271,80 @@ async def add_style_post(req: AddStylePostRequest, user_id: str = Depends(get_cu
         "post_type": req.post_type, "category": category,
         "auto_detected": auto_detected,
         "message": f"Added to {cat_label}" + (" (auto-detected)" if auto_detected else ""),
+    }
+
+
+@app.post("/api/style/preview")
+async def preview_style_split(req: SplitPreviewRequest):
+    """Dry-run the article splitter on pasted text.
+
+    The paste box used to store whatever was in it as one row, so pasting ten
+    articles created one ten-article post. The UI now previews the split first
+    and asks before adding, and this endpoint does the parsing half.
+
+    Nothing is written to the database here.
+    """
+    parsed = article_parser.split_into_articles(req.content or "")
+    articles = parsed["articles"]
+    return {
+        "method": parsed["method"],
+        "count": len(articles),
+        "skipped": parsed["skipped"],
+        "numbering_gaps": parsed["gaps"],
+        "articles": [
+            {
+                "content": a["content"],
+                "number": a.get("number"),
+                "url": a.get("url", ""),
+                "preview": a["content"][:120],
+                "words": len(a["content"].split()),
+            }
+            for a in articles
+        ],
+    }
+
+
+@app.post("/api/style/posts/bulk")
+async def add_style_posts_bulk(
+    req: AddStylePostsBulkRequest, user_id: str = Depends(get_current_user)
+):
+    """Add several style posts in one call, auto-categorizing each one."""
+    uid = req.user_id if req.user_id != "default" else user_id
+    contents = [c.strip() for c in req.contents if c and c.strip()]
+    if not contents:
+        raise HTTPException(status_code=400, detail="No content to add")
+
+    categories = [req.category] * len(contents)
+    auto_detected = 0
+    if not req.category:
+        detected = await auto_categorizer.categorize_batch(contents)
+        categories = [c or "" for c in detected]
+        auto_detected = sum(1 for c in categories if c)
+
+    added = []
+    for content, category in zip(contents, categories):
+        post_id = f"style_{uuid.uuid4().hex[:12]}"
+        database.add_style_post(
+            post_id=post_id, content=content, post_type=req.post_type,
+            user_id=uid, category=category, source_url=req.source_url,
+        )
+        vector_store.add_post(
+            user_id=uid, content=content, category=category,
+            post_type=req.post_type, post_id=post_id,
+        )
+        added.append({"id": post_id, "category": category})
+
+    message = f"{len(added)} posts added"
+    if not req.category:
+        message += f", {auto_detected} auto-categorized"
+        if auto_detected < len(added):
+            message += f" ({len(added) - auto_detected} need a category)"
+    return {
+        "added": len(added),
+        "posts": added,
+        "post_type": req.post_type,
+        "auto_categorized": auto_detected,
+        "message": message,
     }
 
 
