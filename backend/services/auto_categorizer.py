@@ -1,42 +1,96 @@
 """
 Auto-categorization service.
-Classifies articles into categories using LLM when no category is manually selected.
+
+Classifies articles into the configured categories when the user uploads with
+"Auto-detect" instead of picking a category by hand.
+
+Every article that goes in must come out with a category. The previous version
+truncated the batch prompt at 20 articles and padded the rest with empty
+strings, so a 50-article upload silently left 30 posts uncategorized.
 """
 
-from services.llm import llm_service
+import asyncio
+
 from config.settings import settings
+from services.llm import llm_service
+
+# Articles per LLM request. Small enough that the model keeps track of the
+# ordering, large enough to keep the call count (and cost) down.
+BATCH_SIZE = 10
+
+# Concurrent LLM requests. Keeps big uploads fast without tripping rate limits.
+MAX_CONCURRENCY = 4
+
+# How much of each article the classifier sees. The opening lines carry the
+# topic; the tail is usually hashtags and a link.
+PREVIEW_CHARS = 700
 
 
 class AutoCategorizer:
     """Classifies articles into predefined categories."""
 
+    def _valid_ids(self) -> list[str]:
+        return [c["id"] for c in settings.DEFAULT_CATEGORIES]
+
+    def _fallback_id(self) -> str:
+        """Category used only when the LLM is unreachable or unusable."""
+        fallback = getattr(settings, "FALLBACK_CATEGORY", "")
+        valid = self._valid_ids()
+        if fallback in valid:
+            return fallback
+        return valid[0] if valid else ""
+
     def _get_category_list(self) -> str:
         """Build a string of available categories for the LLM prompt."""
-        cats = settings.DEFAULT_CATEGORIES
         lines = []
-        for c in cats:
-            lines.append(f'- "{c["id"]}": {c["label"]} \u2014 {c["description"]}')
+        for c in settings.DEFAULT_CATEGORIES:
+            lines.append(f'- "{c["id"]}": {c["label"]} — {c["description"]}')
         return "\n".join(lines)
 
-    async def categorize_single(self, content: str) -> str:
-        """Classify a single article into one category.
+    def _normalize(self, raw: str) -> str:
+        """Map a model response onto a real category ID, or return ''."""
+        if not raw:
+            return ""
+        cat_id = str(raw).strip().strip('"').strip("'").strip().lower()
+        valid = self._valid_ids()
+        if cat_id in valid:
+            return cat_id
 
-        Returns the category ID string (e.g., "career-growth").
-        """
+        # Tolerate spacing and underscore variants ("career growth").
+        squashed = cat_id.replace("-", "").replace("_", "").replace(" ", "")
+        for vid in valid:
+            if vid.replace("-", "") == squashed:
+                return vid
+        for vid in valid:
+            if vid.replace("-", "") in squashed:
+                return vid
+
+        # Last resort: match on the human-readable label.
+        for c in settings.DEFAULT_CATEGORIES:
+            if c["label"].lower() in cat_id:
+                return c["id"]
+        return ""
+
+    # ─── Single article ───────────────────────────────────────────
+
+    async def categorize_single(self, content: str) -> str:
+        """Classify one article. Returns a category ID, or '' if unusable."""
         if not content or len(content.strip()) < 20:
             return ""
 
-        categories_str = self._get_category_list()
-
-        system_prompt = """You classify LinkedIn posts into categories. 
-Read the post and pick the SINGLE best matching category from the list.
-Respond with ONLY the category ID string, nothing else. No quotes, no explanation."""
-
+        system_prompt = (
+            "You classify LinkedIn posts into categories.\n"
+            "Read the post and pick the SINGLE best matching category.\n"
+            "Every post must be assigned a category. If the fit is imperfect, "
+            "choose the closest one anyway — never refuse and never invent a "
+            "new category.\n"
+            "Respond with ONLY the category ID string. No quotes, no explanation."
+        )
         user_prompt = f"""Categories:
-{categories_str}
+{self._get_category_list()}
 
 Post to classify:
-{content[:500]}
+{content[:PREVIEW_CHARS]}
 
 Which category ID best fits this post? Reply with just the ID (e.g., career-growth):"""
 
@@ -44,98 +98,113 @@ Which category ID best fits this post? Reply with just the ID (e.g., career-grow
             result = await llm_service.call_light(
                 system_prompt, user_prompt, temperature=0.1,
             )
-            # Clean the response
-            cat_id = result.strip().strip('"').strip("'").lower()
-
-            # Validate it's a real category
-            valid_ids = [c["id"] for c in settings.DEFAULT_CATEGORIES]
-            if cat_id in valid_ids:
-                return cat_id
-
-            # Try partial match (LLM might return "career growth" instead of "career-growth")
-            for vid in valid_ids:
-                if vid.replace("-", "") in cat_id.replace("-", "").replace(" ", ""):
-                    return vid
-
-            # Default fallback
-            return ""
+            return self._normalize(result)
         except Exception:
             return ""
 
+    # ─── Batches ──────────────────────────────────────────────────
+
+    async def _categorize_chunk(self, chunk: list[str]) -> list[str]:
+        """Classify up to BATCH_SIZE articles in one call.
+
+        The model answers with an index -> category map rather than a bare
+        array, so a missing or extra entry can never shift every following
+        article onto the wrong category.
+        """
+        numbered = []
+        for i, art in enumerate(chunk, start=1):
+            preview = " ".join(art.split())[:PREVIEW_CHARS]
+            numbered.append(f"[{i}]\n{preview}")
+        articles_text = "\n\n".join(numbered)
+
+        system_prompt = (
+            "You classify LinkedIn posts into categories.\n"
+            "For each numbered post, pick the SINGLE best matching category.\n"
+            "Every post must get a category. If the fit is imperfect, choose "
+            "the closest one anyway — never leave one out, never return an "
+            "empty value, never invent a new category.\n"
+            'Respond with ONLY a JSON object mapping the post number to the '
+            'category ID, e.g. {"1": "career-growth", "2": "system-design"}.'
+        )
+        user_prompt = f"""Categories:
+{self._get_category_list()}
+
+Posts to classify:
+{articles_text}
+
+Return a JSON object with one entry per post number (1 to {len(chunk)}):"""
+
+        result = await llm_service.call_structured(
+            system_prompt, user_prompt, light=True,
+        )
+
+        out = [""] * len(chunk)
+        if isinstance(result, dict):
+            for key, value in result.items():
+                try:
+                    idx = int(str(key).strip().strip("[]")) - 1
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx < len(chunk):
+                    out[idx] = self._normalize(value)
+        elif isinstance(result, list):
+            # Tolerate a model that answers with a plain array anyway.
+            for idx, value in enumerate(result[: len(chunk)]):
+                out[idx] = self._normalize(value)
+        return out
+
     async def categorize_batch(self, articles: list[str]) -> list[str]:
-        """Classify multiple articles at once.
+        """Classify any number of articles.
 
-        For efficiency, sends up to 10 articles in a single LLM call.
-        Falls back to individual calls if batch fails.
+        Runs in three passes so nothing is silently dropped:
+          1. Batched requests, several in flight at once.
+          2. Anything a batch missed is retried on its own.
+          3. Anything still unresolved falls back to the default category.
 
-        Returns list of category IDs in same order as input.
+        Returns one category ID per input article, in the same order.
         """
         if not articles:
             return []
 
-        # For small batches, do individual calls
-        if len(articles) <= 3:
-            results = []
-            for art in articles:
-                cat = await self.categorize_single(art)
-                results.append(cat)
-            return results
+        results: list[str] = [""] * len(articles)
+        semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
-        # For larger batches, try batch classification
-        categories_str = self._get_category_list()
+        chunks = [
+            (start, articles[start : start + BATCH_SIZE])
+            for start in range(0, len(articles), BATCH_SIZE)
+        ]
 
-        # Prepare article summaries (first 200 chars each)
-        article_list = []
-        for i, art in enumerate(articles[:20]):  # Cap at 20
-            preview = art.strip()[:200].replace("\n", " ")
-            article_list.append(f"Article {i+1}: {preview}")
+        async def run_chunk(start: int, chunk: list[str]) -> None:
+            async with semaphore:
+                try:
+                    cats = await self._categorize_chunk(chunk)
+                except Exception:
+                    cats = [""] * len(chunk)
+            for offset, cat in enumerate(cats):
+                results[start + offset] = cat
 
-        articles_text = "\n\n".join(article_list)
+        await asyncio.gather(*(run_chunk(s, c) for s, c in chunks))
 
-        system_prompt = """You classify LinkedIn posts into categories.
-For each article, pick the SINGLE best matching category from the list.
-Respond with ONLY a JSON array of category IDs, in the same order as the articles.
-No explanation, no markdown. Just the JSON array."""
+        # Pass 2 — retry the stragglers individually.
+        missing = [i for i, cat in enumerate(results) if not cat]
 
-        user_prompt = f"""Categories:
-{categories_str}
+        async def run_single(index: int) -> None:
+            async with semaphore:
+                try:
+                    results[index] = await self.categorize_single(articles[index])
+                except Exception:
+                    results[index] = ""
 
-Articles to classify:
-{articles_text}
+        if missing:
+            await asyncio.gather(*(run_single(i) for i in missing))
 
-Return a JSON array with one category ID per article. Example: ["career-growth", "system-design", "ai-engineering"]
-Reply:"""
+        # Pass 3 — never hand back a blank for a real article.
+        fallback = self._fallback_id()
+        for i, cat in enumerate(results):
+            if not cat and articles[i] and len(articles[i].strip()) >= 20:
+                results[i] = fallback
 
-        try:
-            result = await llm_service.call_structured(
-                system_prompt, user_prompt, light=True,
-            )
-
-            if isinstance(result, list):
-                valid_ids = [c["id"] for c in settings.DEFAULT_CATEGORIES]
-                # Validate and clean each result
-                cleaned = []
-                for cat in result:
-                    cat_id = str(cat).strip().strip('"').lower()
-                    if cat_id in valid_ids:
-                        cleaned.append(cat_id)
-                    else:
-                        cleaned.append("")
-                # Pad if LLM returned fewer than expected
-                while len(cleaned) < len(articles):
-                    cleaned.append("")
-                return cleaned[:len(articles)]
-
-            # Unexpected format, fall back to individual
-            raise ValueError("Batch response not a list")
-
-        except Exception:
-            # Fallback: classify individually
-            results = []
-            for art in articles:
-                cat = await self.categorize_single(art)
-                results.append(cat)
-            return results
+        return results
 
 
 auto_categorizer = AutoCategorizer()

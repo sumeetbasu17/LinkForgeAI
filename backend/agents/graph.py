@@ -6,6 +6,8 @@ Flow:
   load_style_context → select_topic → research → draft_post → quality_check
                                                        ↑                |
                                                        └── (if revise) ←┘
+                                                                        |
+                                                             decide_visual → END
 """
 
 from langgraph.graph import StateGraph, END
@@ -17,6 +19,7 @@ from agents.nodes import (
     research,
     draft_post,
     quality_check,
+    decide_visual,
     should_revise,
 )
 
@@ -32,6 +35,7 @@ def create_post_generation_graph() -> StateGraph:
     graph.add_node("research", research)
     graph.add_node("draft_post", draft_post)
     graph.add_node("quality_check", quality_check)
+    graph.add_node("decide_visual", decide_visual)
 
     # Define edges (the flow)
     graph.set_entry_point("load_style_context")
@@ -46,9 +50,12 @@ def create_post_generation_graph() -> StateGraph:
         should_revise,
         {
             "revise": "draft_post",  # Go back to draft with feedback
-            "finalize": END,  # Done — post is ready
+            "finalize": "decide_visual",  # Post is ready — consider an image
         },
     )
+
+    # The visual step judges the finished post, then the run ends.
+    graph.add_edge("decide_visual", END)
 
     return graph.compile()
 

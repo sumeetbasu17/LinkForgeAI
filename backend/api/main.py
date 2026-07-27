@@ -129,21 +129,29 @@ async def get_config():
 
 @app.post("/api/generate", response_model=GeneratePostResponse)
 async def generate(req: GeneratePostRequest):
-    """Generate a new LinkedIn post using the LangGraph agent pipeline."""
+    """Generate a new LinkedIn post using the LangGraph agent pipeline.
 
-    # Check for tone override
+    An explicit choice always wins. Settings act as defaults, filling in only
+    what the request leaves blank — so the tone shown in the Generate tab is
+    the tone the post is actually written in.
+    """
     prefs = database.get_preferences(req.user_id)
+
     tone = req.tone
-    tone_overrides = prefs.get("tone_overrides", {})
-    if req.category in tone_overrides:
-        tone = tone_overrides[req.category]
+    if not tone:
+        # Nothing chosen — fall back to the category's tone, then the default.
+        tone = prefs.get("tone_overrides", {}).get(
+            req.category, prefs.get("default_tone", "Conversational")
+        )
+
+    fmt = req.format or prefs.get("default_format", "story")
 
     # Run the agent pipeline
     result = await generate_post(
         user_id=req.user_id,
         category=req.category,
         topic=req.topic,
-        format=req.format,
+        format=fmt,
         tone=tone,
     )
 
@@ -158,7 +166,7 @@ async def generate(req: GeneratePostRequest):
         content=result.get("final_post", result.get("draft_content", "")),
         category=req.category,
         user_id=req.user_id,
-        format=req.format,
+        format=fmt,
         tone=tone,
         status="draft",
         research_data={"summary": result.get("research_summary", "")},
@@ -177,6 +185,10 @@ async def generate(req: GeneratePostRequest):
         research_summary=result.get("research_summary", ""),
         selected_topic=result.get("selected_topic", ""),
         revision_count=result.get("revision_count", 0),
+        wants_image=result.get("wants_image", False),
+        image_archetype=result.get("image_archetype", ""),
+        image_reason=result.get("image_reason", ""),
+        image_payload=result.get("image_payload", {}) or {},
     )
 
 
@@ -227,6 +239,7 @@ async def delete_post(post_id: str):
 # ─── Style Posts ──────────────────────────────────────────────────
 
 from services.auto_categorizer import auto_categorizer
+from services import article_parser
 
 @app.post("/api/style/posts")
 async def add_style_post(req: AddStylePostRequest, user_id: str = Depends(get_current_user)):
@@ -320,186 +333,119 @@ async def upload_style_file(
     """Upload a file with multiple articles. Auto-categorizes if no category selected.
 
     Supported formats:
-      - .txt: Articles separated by blank lines, '---', or 'Article N :' headers
+      - .pdf: Extracted as one continuous document, then split on 'Article N :'
+              headers (typo tolerant), separators, post URLs, or blank lines
+      - .txt: Same splitting rules as PDF
       - .csv: Columns 'content', optional 'category', 'url'
       - .json: Array of {"content": "...", "category": "...", "url": "..."}
-      - .pdf: Extracts text, splits into articles by page breaks or blank lines
 
-    If category is empty (Auto-detect), each article is classified by AI.
+    If category is empty (Auto-detect), EVERY article is classified by AI.
     If category is set, ALL articles get that category.
     """
-    import re
-
     content_bytes = await file.read()
-    filename = (file.filename or "").lower()
-    added = 0
-    auto_detected = 0
+    filename = file.filename or ""
     use_auto = not category
 
-    parsed_articles = []
+    try:
+        parsed = article_parser.parse_upload(content_bytes, filename)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)[:300])
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"Could not read file: {str(e)[:300]}"
+        )
 
-    # ─── PDF ──────────────────────────────────────────────────
-    if filename.endswith(".pdf"):
-        try:
-            import fitz  # PyMuPDF
-            doc_pdf = fitz.open(stream=content_bytes, filetype="pdf")
-            full_text = ""
-            for page in doc_pdf:
-                full_text += page.get_text() + "\n\n---PAGE_BREAK---\n\n"
-            doc_pdf.close()
-
-            # Split by page breaks first, then by large gaps
-            pages = full_text.split("---PAGE_BREAK---")
-            for page_text in pages:
-                articles_in_page = _split_text_into_articles(page_text)
-                for art in articles_in_page:
-                    parsed_articles.append(art)
-
-        except ImportError:
-            raise HTTPException(
-                status_code=400,
-                detail="PDF support requires pymupdf. Run: pip install pymupdf"
-            )
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Could not read PDF: {str(e)[:200]}")
-
-    # ─── JSON ─────────────────────────────────────────────────
-    elif filename.endswith(".json"):
-        import json as json_mod
-        text = content_bytes.decode("utf-8", errors="ignore")
-        try:
-            articles = json_mod.loads(text)
-            if not isinstance(articles, list):
-                articles = [articles]
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON file")
-
-        for art in articles:
-            if isinstance(art, str):
-                art = {"content": art}
-            art_content = art.get("content", "").strip()
-            if art_content and len(art_content) >= 20:
-                parsed_articles.append({
-                    "content": art_content,
-                    "category": art.get("category", ""),
-                    "url": art.get("url", ""),
-                })
-
-    # ─── CSV ──────────────────────────────────────────────────
-    elif filename.endswith(".csv"):
-        import csv, io
-        text = content_bytes.decode("utf-8", errors="ignore")
-        reader = csv.DictReader(io.StringIO(text))
-        for row in reader:
-            art_content = row.get("content", "").strip()
-            if art_content and len(art_content) >= 20:
-                parsed_articles.append({
-                    "content": art_content,
-                    "category": row.get("category", ""),
-                    "url": row.get("url", ""),
-                })
-
-    # ─── Plain text (.txt or anything else) ───────────────────
-    else:
-        text = content_bytes.decode("utf-8", errors="ignore")
-        parsed_articles = _split_text_into_articles(text)
-
+    parsed_articles = parsed["articles"]
     if not parsed_articles:
-        raise HTTPException(status_code=400, detail="No valid articles found (minimum 20 characters each)")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No articles found (each must be at least "
+                f"{article_parser.MIN_ARTICLE_CHARS} characters)."
+            ),
+        )
 
-    # Auto-categorize if needed
-    if use_auto and parsed_articles:
-        contents = [a["content"] for a in parsed_articles]
-        cats = await auto_categorizer.categorize_batch(contents)
-        for i, cat in enumerate(cats):
-            if i < len(parsed_articles) and not parsed_articles[i]["category"]:
+    # Auto-categorize every article that doesn't already carry a category
+    auto_detected = 0
+    if use_auto:
+        pending = [i for i, a in enumerate(parsed_articles) if not a["category"]]
+        if pending:
+            cats = await auto_categorizer.categorize_batch(
+                [parsed_articles[i]["content"] for i in pending]
+            )
+            for i, cat in zip(pending, cats):
                 parsed_articles[i]["category"] = cat
                 if cat:
                     auto_detected += 1
 
-    # Save all
+    added = 0
     for art in parsed_articles:
         pid = f"style_{uuid.uuid4().hex[:12]}"
         art_cat = art["category"] or category
-        database.add_style_post(pid, art["content"], post_type, user_id, art_cat, art.get("url", ""))
+        database.add_style_post(
+            pid, art["content"], post_type, user_id, art_cat, art.get("url", "")
+        )
         vector_store.add_post(user_id, art["content"], art_cat, post_type, pid)
         added += 1
 
-    result = {"added": added, "post_type": post_type}
+    result = {
+        "added": added,
+        "post_type": post_type,
+        "split_method": parsed["method"],
+        "skipped": parsed["skipped"],
+        "numbering_gaps": parsed["gaps"],
+    }
+
+    message = f"{added} articles imported"
     if use_auto:
         result["auto_categorized"] = auto_detected
-        result["message"] = f"{added} articles imported, {auto_detected} auto-categorized"
+        message += f", {auto_detected} auto-categorized"
+        if auto_detected < added:
+            message += f" ({added - auto_detected} need a category)"
     else:
         result["category"] = category
-        result["message"] = f"{added} articles imported to {category}"
+        message += f" to {category}"
+    if parsed["skipped"]:
+        message += f" · {parsed['skipped']} fragment(s) too short, skipped"
+    if parsed["gaps"]:
+        gaps = ", ".join(str(g) for g in parsed["gaps"][:10])
+        message += f" · numbering gap at article {gaps} (missing in the file)"
+    result["message"] = message
     return result
 
 
-def _split_text_into_articles(text: str) -> list[dict]:
-    """Smart article splitter. Handles multiple separator styles:
+@app.post("/api/style/recategorize")
+async def recategorize_style_posts(
+    user_id: str = "default",
+    post_type: str = None,
+    only_uncategorized: bool = True,
+):
+    """Backfill categories on posts already in the library.
 
-    1. 'Article N :' or 'Article N:' headers
-    2. '---' separator lines
-    3. 3+ consecutive blank lines (articles just stacked with gaps)
-    4. LinkedIn URL as article boundary (URL at end = article ends there)
-
-    Returns list of {"content": str, "category": str, "url": str}
+    Lets the user repair an earlier import without re-uploading anything.
+    Set only_uncategorized=false to re-classify everything from scratch.
     """
-    import re
+    posts = database.get_style_posts(user_id=user_id, post_type=post_type)
+    targets = [p for p in posts if not p.get("category")] if only_uncategorized else posts
 
-    # First, check if text uses explicit separators
-    has_article_headers = bool(re.search(r'Article\s+\d+\s*:', text, re.IGNORECASE))
-    has_dashes = bool(re.search(r'\n---+\n', text))
+    if not targets:
+        return {"updated": 0, "message": "Nothing to categorize — all posts already have one."}
 
-    if has_article_headers:
-        parts = re.split(r'\n*Article\s+\d+\s*:\s*', text, flags=re.IGNORECASE)
-    elif has_dashes:
-        parts = re.split(r'\n---+\n', text)
-    else:
-        # No explicit separators — split by 3+ blank lines
-        # This handles "articles stacked with empty lines between them"
-        parts = re.split(r'\n\s*\n\s*\n\s*\n', text)
+    cats = await auto_categorizer.categorize_batch([p["content"] for p in targets])
 
-        # If that only gives 1 chunk, try splitting by LinkedIn URLs
-        # (URL at end of article acts as boundary)
-        if len(parts) <= 1:
-            parts = re.split(
-                r'(https?://(?:www\.)?linkedin\.com/\S+)',
-                text
-            )
-            # Re-merge: content + URL pairs
-            merged = []
-            i = 0
-            while i < len(parts):
-                content = parts[i].strip()
-                url = ""
-                if i + 1 < len(parts) and parts[i + 1].startswith("http"):
-                    url = parts[i + 1].strip()
-                    i += 2
-                else:
-                    i += 1
-                if content and len(content) >= 20:
-                    merged.append({"content": content, "category": "", "url": url})
-            return merged
-
-    # Process parts — extract URLs from end of each
-    articles = []
-    for part in parts:
-        part = part.strip()
-        if not part or len(part) < 20:
+    updated = 0
+    for post, cat in zip(targets, cats):
+        if not cat or cat == post.get("category"):
             continue
+        database.update_style_post_category(post["id"], cat)
+        vector_store.update_post_category(post["id"], cat)
+        updated += 1
 
-        # Extract LinkedIn URL if present at end
-        url = ""
-        url_match = re.search(r'\s*(https?://\S+)\s*$', part)
-        if url_match:
-            url = url_match.group(1).strip()
-            part = part[:url_match.start()].strip()
-
-        if part and len(part) >= 20:
-            articles.append({"content": part, "category": "", "url": url})
-
-    return articles
+    return {
+        "updated": updated,
+        "examined": len(targets),
+        "message": f"{updated} of {len(targets)} posts categorized",
+    }
 
 
 @app.post("/api/style/analyze")
@@ -818,3 +764,387 @@ async def publish_to_linkedin(req: LinkedInPostRequest):
     return result
 
 
+
+# ─── Post Images ──────────────────────────────────────────────────
+
+from fastapi.responses import FileResponse
+from pathlib import Path as _Path
+
+from services import image_templates
+from services.image_renderer import image_renderer, media_dir, RendererUnavailable
+from services.image_style import image_style_analyzer
+from services.visual_agent import visual_agent
+
+# Handles suggested on first run — the user edits these in the Images tab.
+STARTER_HANDLES = [
+    "@BugWhisperer",
+    "@NullPointerKing",
+    "@SemicolonHero",
+    "@WorksOnMyBox",
+    "@DeployAndPray",
+    "@CacheMeOutside",
+    "@GitPushHope",
+]
+
+_ALLOWED_IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def _safe_media_path(stored: str) -> _Path:
+    """Resolve a stored path, refusing anything outside the media directory."""
+    root = media_dir().resolve()
+    candidate = _Path(stored)
+    if not candidate.is_absolute():
+        candidate = root / candidate.name
+    candidate = candidate.resolve()
+    if root not in candidate.parents and candidate != root:
+        raise HTTPException(status_code=400, detail="Invalid media path")
+    return candidate
+
+
+async def _store_upload(file: UploadFile, prefix: str) -> _Path:
+    suffix = _Path(file.filename or "").suffix.lower()
+    if suffix not in _ALLOWED_IMAGE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported image type. Use one of: {', '.join(sorted(_ALLOWED_IMAGE_TYPES))}",
+        )
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(data) > _MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="Image is larger than 10 MB")
+
+    path = media_dir() / f"{prefix}_{uuid.uuid4().hex[:10]}{suffix}"
+    path.write_bytes(data)
+    return path
+
+
+@app.get("/api/scheduler/status")
+async def scheduler_status(user_id: str = "default"):
+    """Why autonomous mode did or didn't post.
+
+    Runs the same evaluation the scheduler uses, so this can never disagree
+    with the real behaviour.
+    """
+    from services import scheduler as sched
+
+    prefs = database.get_preferences(user_id)
+    decision = sched.evaluate(prefs)
+    return {
+        **decision,
+        "job": sched.scheduler_info(),
+        "last_tick": sched.last_tick(),
+        "linkedin_connected": bool(database.get_linkedin_token(user_id)),
+    }
+
+
+@app.get("/api/images/config")
+async def get_image_config():
+    """Archetypes and defaults the Images tab needs to render its controls."""
+    return {
+        "archetypes": [
+            {"id": "social-card", "label": "Social card",
+             "description": "Avatar, name, handle, then a question"},
+            {"id": "interview-card", "label": "Interview card",
+             "description": "Series badge, coloured title, highlights, CTA footer"},
+            {"id": "code-card", "label": "Code card",
+             "description": "Syntax-highlighted snippet in a window frame"},
+            {"id": "diagram", "label": "Diagram",
+             "description": "Architecture or flow, drawn from Mermaid"},
+        ],
+        "starter_handles": STARTER_HANDLES,
+        "default_style": image_templates.DEFAULT_STYLE,
+    }
+
+
+@app.get("/api/images/identity")
+async def get_image_identity(user_id: str = "default"):
+    """Identity plus handle pool used on generated cards."""
+    identity = database.get_image_identity(user_id)
+    identity["avatar_url"] = (
+        f"/api/images/file/{_Path(identity['avatar_path']).name}"
+        if identity.get("avatar_path")
+        else ""
+    )
+    return {"identity": identity, "handles": database.list_image_handles(user_id)}
+
+
+class ImageIdentityUpdate(BaseModel):
+    display_name: Optional[str] = None
+    headline: Optional[str] = None
+    verified: Optional[bool] = None
+    verified_color: Optional[str] = None
+    handle_strategy: Optional[str] = None
+    user_id: str = "default"
+
+
+@app.put("/api/images/identity")
+async def update_image_identity(req: ImageIdentityUpdate):
+    """Update the name, headline, badge and rotation strategy."""
+    fields = req.model_dump(exclude={"user_id"}, exclude_none=True)
+    return database.update_image_identity(req.user_id, **fields)
+
+
+@app.post("/api/images/avatar")
+async def upload_avatar(file: UploadFile = File(...), user_id: str = Form("default")):
+    """Upload the profile photo shown on cards."""
+    previous = database.get_image_identity(user_id).get("avatar_path", "")
+    path = await _store_upload(file, "avatar")
+    database.update_image_identity(user_id, avatar_path=str(path))
+
+    if previous:
+        try:
+            _safe_media_path(previous).unlink(missing_ok=True)
+        except (HTTPException, OSError):
+            pass
+
+    return {"avatar_url": f"/api/images/file/{path.name}", "message": "Avatar updated"}
+
+
+class HandleCreate(BaseModel):
+    handle: str
+    user_id: str = "default"
+
+
+@app.post("/api/images/handles")
+async def add_image_handle(req: HandleCreate):
+    """Add one handle to the rotation pool."""
+    if not req.handle.strip():
+        raise HTTPException(status_code=400, detail="Handle cannot be empty")
+    result = database.add_image_handle(
+        f"hdl_{uuid.uuid4().hex[:10]}", req.handle, req.user_id
+    )
+    if result["duplicate"]:
+        return {**result, "message": f"{result['handle']} is already in the pool"}
+    return {**result, "message": f"Added {result['handle']}"}
+
+
+@app.post("/api/images/handles/seed")
+async def seed_image_handles(user_id: str = "default"):
+    """Populate the pool with the starter handles, skipping any that exist."""
+    added = 0
+    for handle in STARTER_HANDLES:
+        if not database.add_image_handle(f"hdl_{uuid.uuid4().hex[:10]}", handle, user_id)["duplicate"]:
+            added += 1
+    return {"added": added, "message": f"{added} handles added"}
+
+
+@app.put("/api/images/handles/{handle_id}")
+async def toggle_image_handle(handle_id: str, enabled: bool = True):
+    """Enable or disable a handle without deleting it."""
+    if not database.set_image_handle_enabled(handle_id, enabled):
+        raise HTTPException(status_code=404, detail="Handle not found")
+    return {"id": handle_id, "enabled": enabled}
+
+
+@app.delete("/api/images/handles/{handle_id}")
+async def delete_image_handle(handle_id: str):
+    if not database.delete_image_handle(handle_id):
+        raise HTTPException(status_code=404, detail="Handle not found")
+    return {"deleted": True, "id": handle_id}
+
+
+@app.get("/api/images/presets")
+async def list_image_presets(user_id: str = "default", archetype: str = None):
+    """Style presets extracted from uploaded inspiration images."""
+    presets = database.list_image_presets(user_id, archetype)
+    for preset in presets:
+        preset["source_url"] = (
+            f"/api/images/file/{_Path(preset['source_image']).name}"
+            if preset.get("source_image")
+            else ""
+        )
+    return {"presets": presets, "total": len(presets)}
+
+
+@app.post("/api/images/inspiration")
+async def upload_inspiration_image(
+    file: UploadFile = File(...), user_id: str = Form("default"),
+):
+    """Upload a reference image and extract a reusable style preset.
+
+    The vision model runs once, here. Generation later reads the stored preset
+    rather than looking at the image again.
+    """
+    path = await _store_upload(file, "inspo")
+
+    try:
+        analysis = await image_style_analyzer.analyze(str(path))
+    except Exception as e:
+        path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Could not analyse image: {str(e)[:200]}")
+
+    preset_id = f"preset_{uuid.uuid4().hex[:10]}"
+    database.add_image_preset(
+        preset_id=preset_id,
+        archetype=analysis["archetype"],
+        style=analysis["style"],
+        name=analysis.get("name") or analysis["archetype"],
+        source_image=str(path),
+        user_id=user_id,
+    )
+
+    return {
+        "id": preset_id,
+        "archetype": analysis["archetype"],
+        "name": analysis.get("name", ""),
+        "style": analysis["style"],
+        "source_url": f"/api/images/file/{path.name}",
+        "warning": analysis.get("warning", ""),
+        "message": f"Style learned as {analysis['archetype']}",
+    }
+
+
+@app.delete("/api/images/presets/{preset_id}")
+async def delete_image_preset(preset_id: str):
+    preset = database.delete_image_preset(preset_id)
+    if not preset:
+        raise HTTPException(status_code=404, detail="Preset not found")
+    if preset.get("source_image"):
+        try:
+            _safe_media_path(preset["source_image"]).unlink(missing_ok=True)
+        except (HTTPException, OSError):
+            pass
+    return {"deleted": True, "id": preset_id}
+
+
+class ImageGenerateRequest(BaseModel):
+    post_id: str = ""
+    content: str = ""
+    archetype: str = ""        # blank lets the agent choose
+    preset_id: str = ""        # blank picks a preset matching the archetype
+    handle: str = ""           # blank draws the next one from the pool
+    payload: Optional[dict] = None  # supply to skip the writing step
+    user_id: str = "default"
+
+
+@app.post("/api/images/generate")
+async def generate_post_image(req: ImageGenerateRequest):
+    """Render an image for a post.
+
+    With no archetype or payload the agent decides and writes the content;
+    supply either to override it from the Editor.
+    """
+    content = req.content
+    if req.post_id and not content:
+        post = database.get_post(req.post_id)
+        if not post:
+            raise HTTPException(status_code=404, detail="Post not found")
+        content = post["content"]
+    if not content and not req.payload:
+        raise HTTPException(status_code=400, detail="Provide post_id, content, or payload")
+
+    archetype = req.archetype
+    payload = req.payload or {}
+    reason = ""
+
+    if not payload:
+        if not archetype:
+            decision = await visual_agent.decide(content, "", "")
+            if not decision["needs_image"]:
+                return {
+                    "generated": False,
+                    "reason": decision["reason"],
+                    "message": "No image — " + (decision["reason"] or "not a good fit"),
+                }
+            archetype = decision["archetype"]
+            reason = decision["reason"]
+        try:
+            payload = await visual_agent.write_payload(content, archetype)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e)[:300])
+
+    archetype = archetype or "social-card"
+
+    # Pick the style preset: the requested one, else any learned preset for
+    # this archetype, else the built-in defaults.
+    style = None
+    preset_id = req.preset_id
+    presets = database.list_image_presets(req.user_id)
+    if preset_id:
+        match = next((p for p in presets if p["id"] == preset_id), None)
+        if not match:
+            raise HTTPException(status_code=404, detail="Preset not found")
+        style = match["style"]
+    else:
+        match = next(
+            (p for p in presets if p["archetype"] == archetype and p["enabled"]), None
+        )
+        if match:
+            style = match["style"]
+            preset_id = match["id"]
+
+    identity = database.get_image_identity(req.user_id)
+
+    # Only the person-shaped cards carry a handle.
+    handle = ""
+    if archetype in ("social-card", "interview-card"):
+        handle = req.handle or database.pick_image_handle(
+            req.user_id, identity.get("handle_strategy", "round-robin")
+        )
+
+    try:
+        path = await image_renderer.render_card(
+            archetype, payload, style, identity, handle
+        )
+    except RendererUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Render failed: {str(e)[:300]}")
+
+    image_id = f"img_{uuid.uuid4().hex[:10]}"
+    database.add_post_image(
+        image_id=image_id,
+        archetype=archetype,
+        file_path=str(path),
+        post_id=req.post_id,
+        preset_id=preset_id,
+        handle=handle,
+        payload=payload,
+        user_id=req.user_id,
+    )
+
+    return {
+        "generated": True,
+        "id": image_id,
+        "archetype": archetype,
+        "handle": handle,
+        "preset_id": preset_id,
+        "payload": payload,
+        "reason": reason,
+        "url": f"/api/images/file/{path.name}",
+        "message": f"{archetype} generated",
+    }
+
+
+@app.get("/api/images/post/{post_id}")
+async def list_images_for_post(post_id: str):
+    images = database.get_post_images(post_id)
+    for img in images:
+        img["url"] = f"/api/images/file/{_Path(img['file_path']).name}"
+    return {"images": images, "total": len(images)}
+
+
+@app.delete("/api/images/{image_id}")
+async def delete_generated_image(image_id: str):
+    image = database.delete_post_image(image_id)
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+    try:
+        _safe_media_path(image["file_path"]).unlink(missing_ok=True)
+    except (HTTPException, OSError):
+        pass
+    return {"deleted": True, "id": image_id}
+
+
+@app.get("/api/images/file/{filename}")
+async def serve_media_file(filename: str):
+    """Serve a generated image, avatar, or inspiration reference."""
+    # Only bare filenames inside the media directory are addressable.
+    if "/" in filename or "\\" in filename or filename.startswith("."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    path = _safe_media_path(filename)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path)

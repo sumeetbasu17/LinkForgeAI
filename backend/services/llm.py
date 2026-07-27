@@ -114,6 +114,31 @@ class LLMService:
         ]
         return await self._call(messages, model, temperature, max_tokens=1000)
 
+    async def call_vision(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_data_uri: str,
+        temperature: float = 0.2,
+    ) -> str:
+        """Send an image plus a prompt to a vision-capable model.
+
+        Used once per uploaded inspiration image to extract a reusable style
+        preset — never on the hot path of post generation.
+        """
+        model = settings.VISION_MODEL or _DEFAULT_HEAVY
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "image_url", "image_url": {"url": image_data_uri}},
+                ],
+            },
+        ]
+        return await self._call(messages, model, temperature, max_tokens=1500)
+
     async def call_structured(
         self,
         system_prompt: str,

@@ -22,42 +22,108 @@ from db.database import database
 logger = logging.getLogger("scheduler")
 
 
-def _should_post_now(prefs: dict) -> bool:
-    """Check if a user should get a post generated right now."""
-    if not prefs.get("auto_post_enabled"):
-        return False
+# How long after the target time a post may still go out. A laptop that was
+# asleep, a server restart, or a missed tick should not silently cost a day's
+# post — but nothing should fire at midnight either.
+CATCH_UP_MINUTES = 240
 
-    now = datetime.now()
-    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    current_day = day_names[now.weekday()]
+DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-    # Is today a preferred day?
-    preferred_days = prefs.get("preferred_days", [])
-    if current_day not in preferred_days:
-        return False
 
-    # Is it within 30 minutes of preferred time?
+def _week_start(now: datetime) -> datetime:
+    """Monday 00:00 of the current week."""
+    monday = now - timedelta(days=now.weekday())
+    return monday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _parse_target(preferred_time: str, now: datetime):
+    """Turn the stored preferred time into today's datetime, or None."""
+    for fmt in ("%I:%M %p", "%H:%M"):
+        try:
+            return datetime.strptime((preferred_time or "").strip(), fmt).replace(
+                year=now.year, month=now.month, day=now.day
+            )
+        except ValueError:
+            continue
+    return None
+
+
+def evaluate(prefs: dict, now: datetime = None) -> dict:
+    """Decide whether to post right now, and explain why or why not.
+
+    The scheduler tick and the /api/scheduler/status endpoint both call this,
+    so the diagnostic can never drift from what actually happens.
+    """
+    now = now or datetime.now()
+    user_id = prefs.get("user_id", "default")
+    today = DAY_NAMES[now.weekday()]
+    preferred_days = prefs.get("preferred_days") or []
+    cap = prefs.get("posting_frequency") or 0
     preferred_time = prefs.get("preferred_time", "9:00 AM")
-    try:
-        target = datetime.strptime(preferred_time, "%I:%M %p").replace(
-            year=now.year, month=now.month, day=now.day
-        )
-        diff = abs((now - target).total_seconds())
-        if diff > 1800:  # Not within 30 min window
-            return False
-    except ValueError:
-        return False
 
-    # Check if already posted today
-    posts = database.list_posts(
-        user_id=prefs["user_id"], status="published", limit=1
+    published_this_week = database.count_published_since(
+        user_id, _week_start(now).isoformat()
     )
-    if posts:
-        last_post_date = posts[0].get("created_at", "")
-        if last_post_date.startswith(now.strftime("%Y-%m-%d")):
-            return False  # Already posted today
+    target = _parse_target(preferred_time, now)
 
-    return True
+    posted_today = False
+    recent = database.list_posts(user_id=user_id, status="published", limit=1)
+    if recent:
+        posted_today = (recent[0].get("created_at") or "").startswith(
+            now.strftime("%Y-%m-%d")
+        )
+
+    ctx = {
+        "now": now.isoformat(timespec="seconds"),
+        "today": today,
+        "preferred_days": preferred_days,
+        "preferred_time": preferred_time,
+        "target_time": target.isoformat(timespec="seconds") if target else None,
+        "catch_up_until": (
+            (target + timedelta(minutes=CATCH_UP_MINUTES)).isoformat(timespec="seconds")
+            if target
+            else None
+        ),
+        "weekly_cap": cap,
+        "published_this_week": published_this_week,
+        "posted_today": posted_today,
+        "active_categories": prefs.get("active_categories") or [],
+        "auto_post_enabled": bool(prefs.get("auto_post_enabled")),
+    }
+
+    def no(reason):
+        return {"should_post": False, "reason": reason, **ctx}
+
+    if not ctx["auto_post_enabled"]:
+        return no("Autonomous mode is off")
+    if not ctx["active_categories"]:
+        return no("No active categories selected in Settings")
+    if not preferred_days:
+        return no("No days selected in Settings")
+    if today not in preferred_days:
+        return no(f"{today} is not a selected day ({', '.join(preferred_days)})")
+    if target is None:
+        return no(f"Could not read the preferred time {preferred_time!r}")
+    if cap and published_this_week >= cap:
+        return no(f"Weekly cap reached ({published_this_week}/{cap}) — resets Monday")
+    if posted_today:
+        return no("Already published today")
+    if now < target:
+        mins = int((target - now).total_seconds() // 60)
+        return no(f"Too early — {mins} min until {preferred_time}")
+    if now > target + timedelta(minutes=CATCH_UP_MINUTES):
+        return no(
+            f"Missed today's window — {preferred_time} plus "
+            f"{CATCH_UP_MINUTES // 60}h catch-up has passed"
+        )
+
+    return {"should_post": True, "reason": "All conditions met", **ctx}
+
+
+def _should_post_now(prefs: dict) -> bool:
+    """Boolean wrapper kept for callers that only need the decision."""
+    return evaluate(prefs)["should_post"]
+
 
 
 async def _generate_and_publish(user_id: str, prefs: dict):
@@ -130,29 +196,54 @@ async def _generate_and_publish(user_id: str, prefs: dict):
         logger.error(f"Auto-generation error for {user_id}: {e}")
 
 
+_last_tick: dict = {"at": None, "reason": "Not run yet"}
+
+
+def last_tick() -> dict:
+    """What the most recent tick decided. Surfaced by /api/scheduler/status."""
+    return dict(_last_tick)
+
+
 async def run_scheduler_tick():
-    """One tick of the scheduler — check all users and generate if needed.
-
-    Called every 30 minutes by the background loop.
-    """
-    logger.info("Scheduler tick — checking users...")
-
-    # Get all users with auto_post enabled
-    # For now, just check the default user. In production, iterate all users.
+    """One tick of the scheduler — check the user and generate if needed."""
+    # For now, just the default user. In production, iterate all users.
     try:
         prefs = database.get_preferences("default")
-        if _should_post_now(prefs):
-            logger.info("Conditions met — generating post...")
+        decision = evaluate(prefs)
+        _last_tick["at"] = datetime.now().isoformat(timespec="seconds")
+        _last_tick["reason"] = decision["reason"]
+
+        if decision["should_post"]:
+            logger.info("Scheduler tick — conditions met, generating post")
             await _generate_and_publish("default", prefs)
         else:
-            logger.info("No post needed right now")
+            logger.info(f"Scheduler tick — no post: {decision['reason']}")
     except Exception as e:
-        logger.error(f"Scheduler error: {e}")
+        _last_tick["at"] = datetime.now().isoformat(timespec="seconds")
+        _last_tick["reason"] = f"Error: {e}"
+        logger.error(f"Scheduler error: {e}", exc_info=True)
 
 
 # ─── APScheduler (local dev mode) ────────────────────────────────
 
 _scheduler = None
+
+
+# Ticks are cheap — they only read preferences — so run often. The "already
+# posted today" guard is what prevents duplicates, not the tick spacing.
+TICK_MINUTES = 10
+
+
+def scheduler_info() -> dict:
+    """Whether the background job is alive and when it next runs."""
+    if not _scheduler:
+        return {"running": False, "next_run": None, "tick_minutes": TICK_MINUTES}
+    job = _scheduler.get_job("auto_post_check")
+    return {
+        "running": bool(_scheduler.running),
+        "next_run": job.next_run_time.isoformat(timespec="seconds") if job and job.next_run_time else None,
+        "tick_minutes": TICK_MINUTES,
+    }
 
 
 def start_local_scheduler():
@@ -165,12 +256,25 @@ def start_local_scheduler():
         _scheduler.add_job(
             run_scheduler_tick,
             "interval",
-            minutes=30,
+            minutes=TICK_MINUTES,
             id="auto_post_check",
             replace_existing=True,
+            # Without a grace time APScheduler drops any run it is more than one
+            # second late for. A reloading dev server or a sleeping laptop is
+            # routinely later than that, which silently skips every tick.
+            misfire_grace_time=TICK_MINUTES * 60,
+            # If several runs were missed, catch up with one, not a burst.
+            coalesce=True,
+            max_instances=1,
+            # Evaluate shortly after boot so enabling autonomous mode doesn't
+            # wait a full interval to take effect.
+            next_run_time=datetime.now() + timedelta(seconds=20),
         )
         _scheduler.start()
-        logger.info("Local scheduler started (APScheduler, 30-min interval)")
+        logger.info(
+            f"Local scheduler started (APScheduler, {TICK_MINUTES}-min interval, "
+            f"{TICK_MINUTES}-min misfire grace)"
+        )
     except ImportError:
         logger.warning("APScheduler not installed — scheduler disabled")
     except Exception as e:

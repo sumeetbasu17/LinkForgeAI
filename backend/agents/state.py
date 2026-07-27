@@ -40,6 +40,12 @@ class PostGenerationState(TypedDict, total=False):
     inspiration_structures: list
     custom_rules: str
 
+    # Visual
+    wants_image: bool
+    image_archetype: str
+    image_reason: str
+    image_payload: dict
+
     # Output
     final_post: str
     final_title: str
@@ -75,6 +81,10 @@ def make_initial_state(
         similar_past_posts=[],
         inspiration_structures=[],
         custom_rules="",
+        wants_image=False,
+        image_archetype="",
+        image_reason="",
+        image_payload={},
         final_post="",
         final_title="",
         status="pending",

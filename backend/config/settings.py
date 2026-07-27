@@ -21,6 +21,13 @@ class Settings:
     # Vector store
     VECTOR_DB_PATH: str = os.getenv("VECTOR_DB_PATH", "./data/lancedb")
 
+    # Generated post images, uploaded avatars and inspiration references
+    MEDIA_DIR: str = os.getenv("MEDIA_DIR", "./data/media")
+
+    # Vision model used once per uploaded inspiration image to extract a style
+    # preset. Must support image input.
+    VISION_MODEL: str = os.getenv("VISION_MODEL", "anthropic/claude-sonnet-4.5")
+
     # LinkedIn
     LINKEDIN_CLIENT_ID: str = os.getenv("LINKEDIN_CLIENT_ID", "")
     LINKEDIN_CLIENT_SECRET: str = os.getenv("LINKEDIN_CLIENT_SECRET", "")
@@ -49,6 +56,10 @@ class Settings:
         {"id": "google/gemini-2.0-flash-001", "name": "Gemini 2.0 Flash", "tier": "fast", "cost": "$"},
         {"id": "meta-llama/llama-3.3-70b-instruct", "name": "Llama 3.3 70B (free)", "tier": "free", "cost": "free"},
     ]
+
+    # Used only when auto-categorization cannot reach the LLM at all, so an
+    # upload never leaves posts stranded without a category.
+    FALLBACK_CATEGORY: str = os.getenv("FALLBACK_CATEGORY", "career-growth")
 
     DEFAULT_CATEGORIES: list = [
         {

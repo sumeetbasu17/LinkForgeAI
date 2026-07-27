@@ -155,6 +155,24 @@ class VectorStore:
         )
         return _id
 
+    def update_post_category(self, post_id: str, category: str) -> bool:
+        """Update the category on an existing vector record.
+
+        Keeps the vector store in step with SQLite after a recategorization,
+        so category-filtered style retrieval stays correct.
+        """
+        try:
+            table = self.db.open_table("user_posts")
+            safe_id = post_id.replace("'", "''")
+            safe_category = category.replace("'", "''")
+            table.update(
+                where=f"id = '{safe_id}'",
+                values={"category": safe_category},
+            )
+            return True
+        except Exception:
+            return False
+
     def find_similar_posts(
         self,
         content: str,

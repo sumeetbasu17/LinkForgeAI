@@ -15,3 +15,5 @@ pyjwt==2.10.1
 cryptography==44.0.0
 python-multipart==0.0.18
 pymupdf==1.25.3
+playwright==1.49.1
+pygments==2.19.1

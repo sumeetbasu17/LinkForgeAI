@@ -23,19 +23,45 @@ function Loader({text}){return<div style={{...S.card,textAlign:'center',padding:
 // ─── 1. Generate (receives state from parent) ────────────────────
 function GenerateTab({config,toast,genState,setGenState}){
   const [gen,setGen]=useState(false);const [engagement,setEngagement]=useState(null);const [liStatus,setLiStatus]=useState(null);const [publishing,setPublishing]=useState(false);
+  const [prefs,setPrefs]=useState(null);const [fromSettings,setFromSettings]=useState('');
+  const [postImg,setPostImg]=useState(null);const [imgBusy,setImgBusy]=useState(false);
   useEffect(()=>{api.linkedinStatus().then(setLiStatus).catch(()=>{})},[]);
   const {cat,topic,fmt,tone,result}=genState;
   const set=(k,v)=>setGenState(p=>({...p,[k]:v}));
 
-  const generate=async()=>{if(!cat){toast('Select a category','error');return}setGen(true);set('result',null);setEngagement(null);try{const r=await api.generatePost({category:cat,topic,format:fmt,tone});set('result',r);toast('Post generated!');try{const e=await api.predictEngagement(r.content,cat,fmt);setEngagement(e)}catch{}}catch(e){toast(e.message,'error')}finally{setGen(false)}};
+  // Settings supply the starting point; anything picked here wins over them.
+  useEffect(()=>{(async()=>{try{
+    const p=await api.getPreferences();setPrefs(p);
+    setGenState(prev=>({...prev,
+      fmt:prev.fmt||p.default_format||'story',
+      tone:prev.tone||p.default_tone||'Conversational'}));
+  }catch{}})()},[setGenState]);
+
+  const pickCategory=id=>{
+    set('cat',id);
+    const t=prefs?.tone_overrides?.[id];
+    if(t&&t!==tone){set('tone',t);setFromSettings(t)}
+    else if(!t)setFromSettings('');
+  };
+  const pickTone=t=>{set('tone',t);setFromSettings('')};
+
+  const generate=async()=>{if(!cat){toast('Select a category','error');return}setGen(true);set('result',null);setEngagement(null);setPostImg(null);try{const r=await api.generatePost({category:cat,topic,format:fmt,tone});set('result',r);toast('Post generated!');try{const e=await api.predictEngagement(r.content,cat,fmt);setEngagement(e)}catch{}}catch(e){toast(e.message,'error')}finally{setGen(false)}};
   const publish=async()=>{if(!result)return;setPublishing(true);try{await api.publishToLinkedIn({post_id:result.post_id});toast('Published!')}catch(e){toast(e.message,'error')}finally{setPublishing(false)}};
+  const makeImage=async(arch='')=>{if(!result)return;setImgBusy(true);
+    try{const r=await api.generatePostImage({post_id:result.post_id,content:result.content,archetype:arch,
+      ...(arch||!result.image_payload||!Object.keys(result.image_payload).length?{}:{payload:result.image_payload})});
+      if(!r.generated){setPostImg(null);toast(r.message)}else{setPostImg(r);toast(`${r.archetype} rendered`)}}
+    catch(e){toast(e.message,'error')}finally{setImgBusy(false)}};
+  const dropImage=async()=>{if(!postImg)return;try{await api.deletePostImage(postImg.id);setPostImg(null);toast('Image removed')}catch(e){toast(e.message,'error')}};
 
   return(<div style={S.grid2}>
     <div style={S.col}>
       <div style={S.card}><label style={S.label}>Topic (optional)</label><input style={S.input} placeholder="Leave blank for AI to pick trending..." value={topic} onChange={e=>set('topic',e.target.value)}/></div>
-      <div style={S.card}><label style={S.label}>Category</label><div style={{display:'flex',flexWrap:'wrap',gap:'8px'}}>{(config?.categories||[]).map(c=><span key={c.id} style={S.tag(cat===c.id)} onClick={()=>set('cat',c.id)}>{c.icon} {c.label}</span>)}</div></div>
+      <div style={S.card}><label style={S.label}>Category</label><div style={{display:'flex',flexWrap:'wrap',gap:'8px'}}>{(config?.categories||[]).map(c=><span key={c.id} style={S.tag(cat===c.id)} onClick={()=>pickCategory(c.id)}>{c.icon} {c.label}</span>)}</div></div>
       <div style={S.card}><label style={S.label}>Format</label><div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'8px'}}>{(config?.formats||[]).map(f=><div key={f.id} onClick={()=>set('fmt',f.id)} style={{padding:'10px 14px',borderRadius:'10px',cursor:'pointer',background:fmt===f.id?'var(--accent-bg)':'var(--bg-input)',border:`1px solid ${fmt===f.id?'var(--accent)':'var(--border)'}`}}><div style={{fontSize:'13px',fontWeight:600,color:fmt===f.id?'var(--accent)':'var(--text-muted)'}}>{f.label}</div><div style={{fontSize:'11px',color:'var(--text-dim)',marginTop:'2px'}}>{f.description}</div></div>)}</div></div>
-      <div style={S.card}><label style={S.label}>Tone</label><div style={{display:'flex',flexWrap:'wrap',gap:'8px'}}>{(config?.tones||[]).map(t=><span key={t} style={S.tag(tone===t)} onClick={()=>set('tone',t)}>{t}</span>)}</div></div>
+      <div style={S.card}><label style={S.label}>Tone</label><div style={{display:'flex',flexWrap:'wrap',gap:'8px'}}>{(config?.tones||[]).map(t=><span key={t} style={S.tag(tone===t)} onClick={()=>pickTone(t)}>{t}</span>)}</div>
+        <div style={{fontSize:'11px',color:'var(--text-dim)',marginTop:'8px'}}>{fromSettings?`Set to ${fromSettings} by this category's tone in Settings — pick another to override it.`:'This is the tone the post is written in. It overrides Settings.'}</div>
+      </div>
       <button style={{...S.btn(),justifyContent:'center',padding:'14px',opacity:gen?0.7:1}} onClick={generate} disabled={gen}>{gen?'⏳ Generating...':'✨ Generate post'}</button>
     </div>
     <div style={S.col}>
@@ -44,6 +70,29 @@ function GenerateTab({config,toast,genState,setGenState}){
         {result.selected_topic&&<div style={{fontSize:'12px',color:'var(--text-dim)',marginBottom:'10px'}}>Topic: {result.selected_topic}</div>}
         <div style={S.preview}>{result.content}</div>
         {engagement&&<div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:'8px',marginTop:'14px'}}>{[{l:'Overall',v:engagement.overall_score,c:'#6366F1'},{l:'Dwell',v:engagement.dwell_time_score,c:'#3B82F6'},{l:'Save',v:engagement.save_potential,c:'#10B981'},{l:'Comment',v:engagement.comment_potential,c:'#F59E0B'}].map((s,i)=><div key={i} style={{textAlign:'center',padding:'10px',borderRadius:'10px',background:'var(--bg-input)'}}><div style={{fontSize:'20px',fontWeight:700,color:s.c}}>{s.v}</div><div style={{fontSize:'10px',color:'var(--text-dim)',textTransform:'uppercase',marginTop:'2px'}}>{s.l}</div></div>)}</div>}
+        <div style={{marginTop:'14px',padding:'12px',borderRadius:'10px',background:'var(--bg-input)',border:'1px solid var(--border)'}}>
+          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:'10px',flexWrap:'wrap'}}>
+            <div style={{fontSize:'12px',color:'var(--text-dim)'}}>
+              {result.wants_image
+                ?<>Suggested image: <b style={{color:'var(--text)'}}>{result.image_archetype}</b>{result.image_reason?` — ${result.image_reason}`:''}</>
+                :<>No image suggested{result.image_reason?` — ${result.image_reason}`:' — nothing concrete to show'}</>}
+            </div>
+            {!postImg&&<button style={S.btn('ghost')} onClick={()=>makeImage(result.wants_image?'':'')} disabled={imgBusy}>{imgBusy?'⏳...':result.wants_image?'🖼️ Create image':'🖼️ Create anyway'}</button>}
+          </div>
+          {!postImg&&<div style={{display:'flex',flexWrap:'wrap',gap:'6px',marginTop:'10px'}}>
+            {['social-card','interview-card','code-card','diagram'].map(a=><span key={a} style={S.tag(false)} onClick={()=>makeImage(a)}>{a}</span>)}
+          </div>}
+          {postImg&&<div style={{marginTop:'10px'}}>
+            <img src={postImg.url} alt="" style={{width:'100%',borderRadius:'10px',display:'block'}}/>
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginTop:'8px'}}>
+              <span style={{fontSize:'11px',color:'var(--text-dim)'}}>{postImg.archetype}{postImg.handle?` · ${postImg.handle}`:''}</span>
+              <span style={{display:'flex',gap:'8px'}}>
+                <span style={{fontSize:'11px',cursor:'pointer',color:'var(--accent)'}} onClick={()=>makeImage(postImg.archetype)}>Redo</span>
+                <span style={{fontSize:'11px',cursor:'pointer',color:'var(--danger)'}} onClick={dropImage}>Remove</span>
+              </span>
+            </div>
+          </div>}
+        </div>
         <div style={{display:'flex',gap:'8px',marginTop:'14px',flexWrap:'wrap'}}>
           <button style={S.btn('ghost')} onClick={generate}>🔄 Regenerate</button>
           <button style={S.btn('ghost')} onClick={()=>{navigator.clipboard.writeText(result.content);toast('Copied!')}}>📋 Copy</button>
@@ -83,7 +132,7 @@ function StyleTab({config,toast}){
   const [postText,setPostText]=useState('');const [postType,setPostType]=useState('own');const [postCat,setPostCat]=useState('');
   const [stylePosts,setStylePosts]=useState([]);const [counts,setCounts]=useState(null);
   const [profile,setProfile]=useState(null);const [analyzing,setAnalyzing]=useState(false);
-  const [viewCat,setViewCat]=useState('');const [viewType,setViewType]=useState('');const [uploading,setUploading]=useState(false);
+  const [viewCat,setViewCat]=useState('');const [viewType,setViewType]=useState('');const [uploading,setUploading]=useState(false);const [recategorizing,setRecategorizing]=useState(false);
   const fileRef=useRef(null);const categories=config?.categories||[];
   const fetch_=useCallback(async()=>{try{const [p,pr,c]=await Promise.all([api.listStylePosts(viewType||viewCat?{...(viewType?{post_type:viewType}:{}),  ...(viewCat?{category:viewCat}:{})}:{}),api.getStyleProfile(),api.getStyleCounts()]);setStylePosts(p.posts||[]);setProfile(pr);setCounts(c)}catch{}},[viewCat,viewType]);
   useEffect(()=>{fetch_()},[fetch_]);
@@ -92,7 +141,9 @@ function StyleTab({config,toast}){
   const deleteCat=async cat=>{if(!confirm(`Delete all posts in "${cat||'uncategorized'}"?`))return;try{await api.deleteStylePostsBulk({category:cat,...(viewType?{post_type:viewType}:{})});toast('Deleted!');fetch_()}catch(e){toast(e.message,'error')}};
   const deleteAll=async()=>{if(!confirm('Delete ALL style posts?'))return;try{await api.deleteStylePostsBulk({delete_all:'true'});toast('All deleted');fetch_()}catch(e){toast(e.message,'error')}};
   const deleteSingle=async id=>{try{await api.deleteStylePost(id);toast('Removed');fetch_()}catch(e){toast(e.message,'error')}};
+  const recategorize=async()=>{setRecategorizing(true);try{const r=await api.recategorizeStylePosts({...(viewType?{post_type:viewType}:{})});toast(r.message||`${r.updated} categorized`);fetch_()}catch(e){toast(e.message,'error')}finally{setRecategorizing(false)}};
   const totalOwn=counts?.total_own||0;const totalInsp=counts?.total_inspiration||0;const totalComment=counts?.total_comment||0;
+  const totalUncat=['own','inspiration','comment'].reduce((n,t)=>n+(counts?.[t]?.uncategorized||0),0);
 
   return(<div style={S.grid2}>
     <div style={S.col}>
@@ -102,10 +153,11 @@ function StyleTab({config,toast}){
         <div style={{display:'flex',flexWrap:'wrap',gap:'6px',marginBottom:'12px'}}><span style={S.tag(!postCat,'#71717A')} onClick={()=>setPostCat('')}>🔍 Auto-detect</span>{categories.map(c=><span key={c.id} style={S.tag(postCat===c.id)} onClick={()=>setPostCat(c.id)}>{c.icon} {c.label}</span>)}</div>
         <textarea style={S.textarea} placeholder={postType==='comment'?'Paste your LinkedIn comments...':postType==='inspiration'?'Paste a post you admire...':'Paste your LinkedIn post...'} value={postText} onChange={e=>setPostText(e.target.value)}/>
         <div style={{display:'flex',gap:'8px',marginTop:'10px'}}><button style={{...S.btn('ghost'),flex:1,justifyContent:'center'}} onClick={addPost}>+ Add</button><button style={{...S.btn('ghost'),justifyContent:'center',opacity:uploading?0.7:1}} onClick={()=>fileRef.current?.click()} disabled={uploading}>{uploading?'⏳...':'📁 Upload file'}</button><input ref={fileRef} type="file" accept=".txt,.csv,.json,.pdf" style={{display:'none'}} onChange={handleFile}/></div>
-        <div style={{fontSize:'11px',color:'var(--text-dim)',marginTop:'6px'}}>Accepts .txt, .csv, .json, .pdf — articles split automatically by blank lines, --- separators, or page breaks</div>
+        <div style={{fontSize:'11px',color:'var(--text-dim)',marginTop:'6px'}}>Accepts .txt, .csv, .json, .pdf — split on "Article 1 :" headers, --- separators, post links, or blank lines. Articles spanning several pages stay in one piece.</div>
       </div>
       <div style={S.card}><label style={S.label}>Uploaded content</label>
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:'10px'}}>{[{l:'My posts',v:totalOwn,c:'#6366F1'},{l:'Inspiration',v:totalInsp,c:'#F59E0B'},{l:'Comments',v:totalComment,c:'#10B981'}].map((s,i)=><div key={i} style={{textAlign:'center',padding:'12px',borderRadius:'10px',background:'var(--bg-input)'}}><div style={{fontSize:'22px',fontWeight:700,color:s.c}}>{s.v}</div><div style={{fontSize:'11px',color:'var(--text-dim)',marginTop:'2px'}}>{s.l}</div></div>)}</div>
+        {totalUncat>0&&<button style={{...S.btn('ghost'),marginTop:'12px',width:'100%',justifyContent:'center',opacity:recategorizing?0.7:1}} onClick={recategorize} disabled={recategorizing}>{recategorizing?'⏳ Categorizing...':`🏷️ Auto-categorize ${totalUncat} uncategorized`}</button>}
         {totalOwn>=2&&<button style={{...S.btn(),marginTop:'14px',width:'100%',justifyContent:'center',opacity:analyzing?0.7:1}} onClick={async()=>{setAnalyzing(true);try{const r=await api.analyzeStyle();setProfile(r);toast('Style analyzed!')}catch(e){toast(e.message,'error')}finally{setAnalyzing(false)}}} disabled={analyzing}>{analyzing?'🔍 Analyzing...':'🎨 Analyze my style'}</button>}
       </div>
       <div style={S.card}><label style={S.label}>Browse & manage</label>
@@ -139,8 +191,10 @@ function SettingsTab({config,toast}){
   const [selectedModel,setSelectedModel]=useState('');const [customRules,setCustomRules]=useState('');const [rulesSaved,setRulesSaved]=useState(true);
   const DAYS=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];const TIMES=['7:00 AM','8:00 AM','9:00 AM','10:00 AM','12:00 PM','5:00 PM','7:00 PM'];
   const models=config?.models||[];
-  useEffect(()=>{(async()=>{try{const [p,s,li,r]=await Promise.all([api.getPreferences(),api.listPosts({status:'scheduled'}),api.linkedinStatus(),api.getRules()]);setPrefs(p);setScheduled(s.posts||[]);setLiStatus(li);setSelectedModel(p.preferred_model||models[0]?.id||'');setCustomRules(r.rules||'')}catch{}})()},[]);
-  const save=async u=>{try{const r=await api.updatePreferences(u);setPrefs(r)}catch(e){toast(e.message,'error')}};
+  const [schedStatus,setSchedStatus]=useState(null);
+  const loadSched=useCallback(()=>{api.schedulerStatus().then(setSchedStatus).catch(()=>{})},[]);
+  useEffect(()=>{(async()=>{try{const [p,s,li,r]=await Promise.all([api.getPreferences(),api.listPosts({status:'scheduled'}),api.linkedinStatus(),api.getRules()]);setPrefs(p);setScheduled(s.posts||[]);setLiStatus(li);setSelectedModel(p.preferred_model||models[0]?.id||'');setCustomRules(r.rules||'')}catch{}})();loadSched()},[loadSched]);
+  const save=async u=>{try{const r=await api.updatePreferences(u);setPrefs(r);loadSched()}catch(e){toast(e.message,'error')}};
   const saveRules=async()=>{try{await api.updateRules(customRules);setRulesSaved(true);toast('Rules saved!')}catch(e){toast(e.message,'error')}};
   if(!prefs)return<Loader/>;
   return(<div style={S.grid2}>
@@ -149,13 +203,33 @@ function SettingsTab({config,toast}){
 
       <div style={S.card}><label style={S.label}>LLM Model</label><div style={S.col}>{models.map(m=>(<div key={m.id} onClick={async()=>{setSelectedModel(m.id);try{await api.selectModel(m.id);toast(`Model: ${m.name}`)}catch(e){toast(e.message,'error')}}} style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'10px 14px',borderRadius:'10px',cursor:'pointer',background:selectedModel===m.id?'var(--accent-bg)':'var(--bg-input)',border:`1px solid ${selectedModel===m.id?'var(--accent)':'var(--border)'}`}}><div><div style={{fontSize:'14px',fontWeight:600,color:selectedModel===m.id?'var(--accent)':'var(--text-muted)'}}>{m.name}</div><div style={{fontSize:'11px',color:'var(--text-dim)',marginTop:'2px'}}>{m.id}</div></div><div style={{display:'flex',gap:'6px',alignItems:'center'}}><span style={S.badge(m.tier==='best'?'#8B5CF6':m.tier==='fast'?'#10B981':m.tier==='free'?'#F59E0B':'#3B82F6')}>{m.tier}</span><span style={{fontSize:'12px',color:'var(--text-dim)'}}>{m.cost}</span></div></div>))}</div></div>
 
-      <div style={S.card}><label style={S.label}>Frequency</label><div style={{display:'flex',alignItems:'center',gap:'16px'}}><input type="range" min="1" max="5" value={prefs.posting_frequency} onChange={e=>save({posting_frequency:+e.target.value})} style={{flex:1,accentColor:'var(--accent)'}}/><span style={{fontSize:'24px',fontWeight:700,color:'var(--accent)'}}>{prefs.posting_frequency}x/wk</span></div></div>
+      <div style={S.card}><label style={S.label}>Days</label><div style={{display:'flex',gap:'8px'}}>{DAYS.map(d=><div key={d} onClick={()=>{const days=prefs.preferred_days||[];save({preferred_days:days.includes(d)?days.filter(x=>x!==d):[...days,d]})}} style={{width:'42px',height:'42px',borderRadius:'10px',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'12px',fontWeight:600,background:prefs.preferred_days?.includes(d)?'var(--accent-bg)':'var(--bg-input)',border:`1px solid ${prefs.preferred_days?.includes(d)?'var(--accent)':'var(--border)'}`,color:prefs.preferred_days?.includes(d)?'var(--accent)':'var(--text-dim)'}}>{d}</div>)}</div>
+        <div style={{fontSize:'12px',color:'var(--text-dim)',marginTop:'10px'}}>Days set your cadence — {(prefs.preferred_days||[]).length||'no'} post{(prefs.preferred_days||[]).length===1?'':'s'} a week.</div>
+      </div>
 
-      <div style={S.card}><label style={S.label}>Days</label><div style={{display:'flex',gap:'8px'}}>{DAYS.map(d=><div key={d} onClick={()=>{const days=prefs.preferred_days||[];save({preferred_days:days.includes(d)?days.filter(x=>x!==d):[...days,d]})}} style={{width:'42px',height:'42px',borderRadius:'10px',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'12px',fontWeight:600,background:prefs.preferred_days?.includes(d)?'var(--accent-bg)':'var(--bg-input)',border:`1px solid ${prefs.preferred_days?.includes(d)?'var(--accent)':'var(--border)'}`,color:prefs.preferred_days?.includes(d)?'var(--accent)':'var(--text-dim)'}}>{d}</div>)}</div></div>
+      <div style={S.card}><label style={S.label}>Weekly cap</label><div style={{display:'flex',alignItems:'center',gap:'16px'}}><input type="range" min="1" max="7" step="1" value={prefs.posting_frequency} onChange={e=>save({posting_frequency:+e.target.value})} style={{flex:1,accentColor:'var(--accent)'}}/><span style={{fontSize:'24px',fontWeight:700,color:'var(--accent)'}}>max {prefs.posting_frequency}</span></div>
+        {(prefs.preferred_days||[]).length>prefs.posting_frequency
+          ? <div style={{marginTop:'10px',padding:'10px',borderRadius:'8px',background:'var(--accent-bg)',fontSize:'12px',color:'var(--accent)'}}>You've selected {(prefs.preferred_days||[]).length} days but capped at {prefs.posting_frequency}/week — posting stops once the cap is hit, then resets Monday.</div>
+          : <div style={{fontSize:'12px',color:'var(--text-dim)',marginTop:'10px'}}>A hard ceiling on autonomous posts per week, counted Monday to Sunday. Your {(prefs.preferred_days||[]).length} selected days sit within it.</div>}
+      </div>
 
       <div style={S.card}><label style={S.label}>Time</label><div style={{display:'flex',flexWrap:'wrap',gap:'8px'}}>{TIMES.map(t=><span key={t} style={S.tag(prefs.preferred_time===t,'#10B981')} onClick={()=>save({preferred_time:t})}>{t}</span>)}</div><div style={{marginTop:'12px',padding:'12px',borderRadius:'10px',background:'var(--success-bg)',fontSize:'13px',color:'var(--success)'}}>🎯 IST: 8-9 AM and 5-7 PM weekdays work best.</div></div>
 
-      <div style={S.card}><div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}><div><div style={{fontSize:'14px',fontWeight:600}}>Autonomous mode</div><div style={{fontSize:'12px',color:'var(--text-dim)',marginTop:'2px'}}>Auto-generate and publish</div></div><div onClick={()=>save({auto_post_enabled:!prefs.auto_post_enabled})} style={{width:'46px',height:'26px',borderRadius:'13px',cursor:'pointer',background:prefs.auto_post_enabled?'var(--accent)':'var(--bg-input)',border:`1px solid ${prefs.auto_post_enabled?'var(--accent)':'var(--border)'}`,position:'relative',flexShrink:0}}><div style={{width:'20px',height:'20px',borderRadius:'10px',background:'#fff',position:'absolute',top:'2px',left:prefs.auto_post_enabled?'23px':'2px',transition:'left 0.2s'}}/></div></div>{prefs.auto_post_enabled?<div style={{marginTop:'10px',padding:'10px',borderRadius:'8px',background:'var(--accent-bg)',fontSize:'12px',color:'var(--accent)'}}>ON — posts auto-generated on your schedule. Turn OFF anytime to pause.</div>:<div style={{marginTop:'10px',padding:'10px',borderRadius:'8px',background:'var(--bg-input)',fontSize:'12px',color:'var(--text-dim)'}}>OFF — generate manually from Generate tab. Turn ON for hands-free posting.</div>}</div>
+      <div style={S.card}><div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}><div><div style={{fontSize:'14px',fontWeight:600}}>Autonomous mode</div><div style={{fontSize:'12px',color:'var(--text-dim)',marginTop:'2px'}}>Auto-generate and publish</div></div><div onClick={()=>save({auto_post_enabled:!prefs.auto_post_enabled})} style={{width:'46px',height:'26px',borderRadius:'13px',cursor:'pointer',background:prefs.auto_post_enabled?'var(--accent)':'var(--bg-input)',border:`1px solid ${prefs.auto_post_enabled?'var(--accent)':'var(--border)'}`,position:'relative',flexShrink:0}}><div style={{width:'20px',height:'20px',borderRadius:'10px',background:'#fff',position:'absolute',top:'2px',left:prefs.auto_post_enabled?'23px':'2px',transition:'left 0.2s'}}/></div></div>{prefs.auto_post_enabled?<div style={{marginTop:'10px',padding:'10px',borderRadius:'8px',background:'var(--accent-bg)',fontSize:'12px',color:'var(--accent)'}}>ON — posts auto-generated on your schedule. Turn OFF anytime to pause.</div>:<div style={{marginTop:'10px',padding:'10px',borderRadius:'8px',background:'var(--bg-input)',fontSize:'12px',color:'var(--text-dim)'}}>OFF — generate manually from Generate tab. Turn ON for hands-free posting.</div>}
+        {schedStatus&&<div style={{marginTop:'10px',padding:'12px',borderRadius:'8px',background:'var(--bg-input)',border:'1px solid var(--border)',fontSize:'12px'}}>
+          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'6px'}}>
+            <span style={{fontWeight:600}}>Right now: {schedStatus.should_post?'would post':'would not post'}</span>
+            <span style={{cursor:'pointer',color:'var(--accent)',fontSize:'11px'}} onClick={loadSched}>refresh</span>
+          </div>
+          <div style={{color:'var(--text-dim)',lineHeight:1.6}}>
+            <div>{schedStatus.reason}</div>
+            {schedStatus.target_time&&<div>Window: {schedStatus.target_time.slice(11,16)} → {schedStatus.catch_up_until?.slice(11,16)} today</div>}
+            <div>This week: {schedStatus.published_this_week}/{schedStatus.weekly_cap||'∞'} published</div>
+            <div>Background job: {schedStatus.job?.running?`running, next check ${schedStatus.job.next_run?.slice(11,16)||'—'}`:'NOT RUNNING'}</div>
+            <div>Last check: {schedStatus.last_tick?.at?`${schedStatus.last_tick.at.slice(11,16)} — ${schedStatus.last_tick.reason}`:'never'}</div>
+            {!schedStatus.linkedin_connected&&<div style={{color:'var(--danger)'}}>LinkedIn not connected — posts would save as scheduled, not publish.</div>}
+          </div>
+        </div>}</div>
 
       <div style={S.card}><label style={S.label}>Custom rules</label><p style={{fontSize:'13px',color:'var(--text-dim)',margin:'0 0 10px'}}>Strictly followed when generating posts. One rule per line.</p><textarea style={{...S.textarea,minHeight:'120px'}} placeholder={"Example:\n- Never write about building in public\n- Don't mention interview experiences\n- Avoid: synergy, leverage, game-changer\n- Always include code in technical posts"} value={customRules} onChange={e=>{setCustomRules(e.target.value);setRulesSaved(false)}}/><button style={{...S.btn(rulesSaved?'ghost':'primary'),marginTop:'10px',width:'100%',justifyContent:'center'}} onClick={saveRules}>{rulesSaved?'✓ Rules saved':'💾 Save rules'}</button></div>
     </div>
@@ -170,12 +244,124 @@ function SettingsTab({config,toast}){
   </div>);
 }
 
+// ─── Images ──────────────────────────────────────────────────────
+function ImagesTab({toast}){
+  const [identity,setIdentity]=useState(null);const [handles,setHandles]=useState([]);
+  const [presets,setPresets]=useState([]);const [imgCfg,setImgCfg]=useState(null);
+  const [newHandle,setNewHandle]=useState('');const [busy,setBusy]=useState('');
+  const [testArch,setTestArch]=useState('social-card');const [testText,setTestText]=useState('');
+  const [testImg,setTestImg]=useState(null);
+  const avatarRef=useRef(null);const inspoRef=useRef(null);
+
+  const fetch_=useCallback(async()=>{try{const [i,p,c]=await Promise.all([api.getImageIdentity(),api.listImagePresets(),api.getImageConfig()]);setIdentity(i.identity);setHandles(i.handles||[]);setPresets(p.presets||[]);setImgCfg(c)}catch(e){toast(e.message,'error')}},[toast]);
+  useEffect(()=>{fetch_()},[fetch_]);
+
+  const saveIdentity=async(patch)=>{try{const r=await api.updateImageIdentity(patch);setIdentity({...r,avatar_url:identity?.avatar_url||''});toast('Saved')}catch(e){toast(e.message,'error')}};
+  const onAvatar=async e=>{const f=e.target.files?.[0];if(!f)return;setBusy('avatar');try{await api.uploadAvatar(f);toast('Photo updated');fetch_()}catch(e){toast(e.message,'error')}finally{setBusy('');if(avatarRef.current)avatarRef.current.value=''}};
+  const onInspo=async e=>{const files=Array.from(e.target.files||[]);if(!files.length)return;setBusy('inspo');let ok=0;
+    for(const f of files){try{const r=await api.uploadInspirationImage(f);ok++;if(r.warning)toast(r.warning,'error')}catch(err){toast(`${f.name}: ${err.message}`,'error')}}
+    toast(`${ok} of ${files.length} analyzed`);setBusy('');if(inspoRef.current)inspoRef.current.value='';fetch_()};
+  const addHandle=async()=>{if(!newHandle.trim())return;try{const r=await api.addImageHandle(newHandle.trim());toast(r.message);setNewHandle('');fetch_()}catch(e){toast(e.message,'error')}};
+  const seed=async()=>{try{const r=await api.seedImageHandles();toast(r.message);fetch_()}catch(e){toast(e.message,'error')}};
+  const delHandle=async id=>{try{await api.deleteImageHandle(id);fetch_()}catch(e){toast(e.message,'error')}};
+  const toggleHandle=async(id,en)=>{try{await api.toggleImageHandle(id,en);fetch_()}catch(e){toast(e.message,'error')}};
+  const delPreset=async id=>{if(!confirm('Delete this style preset?'))return;try{await api.deleteImagePreset(id);toast('Deleted');fetch_()}catch(e){toast(e.message,'error')}};
+  const runTest=async()=>{if(!testText.trim()){toast('Paste a post to preview','error');return}setBusy('test');setTestImg(null);
+    try{const r=await api.generatePostImage({content:testText,archetype:testArch});
+      if(!r.generated){toast(r.message);}else{setTestImg(r);toast(`${r.archetype} rendered`)}}
+    catch(e){toast(e.message,'error')}finally{setBusy('')}};
+
+  const archetypes=imgCfg?.archetypes||[];
+  return(<div style={S.grid2}>
+    <div style={S.col}>
+      <div style={S.card}><label style={S.label}>Card identity</label>
+        <div style={{display:'flex',gap:'14px',alignItems:'center',marginBottom:'14px'}}>
+          {identity?.avatar_url
+            ? <img src={identity.avatar_url} alt="" style={{width:'62px',height:'62px',borderRadius:'50%',objectFit:'cover'}}/>
+            : <div style={{width:'62px',height:'62px',borderRadius:'50%',background:'var(--bg-input)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'20px',color:'var(--text-dim)'}}>👤</div>}
+          <button style={S.btn('ghost')} onClick={()=>avatarRef.current?.click()} disabled={busy==='avatar'}>{busy==='avatar'?'⏳...':'Upload photo'}</button>
+          <input ref={avatarRef} type="file" accept="image/*" style={{display:'none'}} onChange={onAvatar}/>
+        </div>
+        <label style={S.label}>Display name</label>
+        <input style={S.input} value={identity?.display_name||''} placeholder="Sumeet Basu"
+          onChange={e=>setIdentity({...identity,display_name:e.target.value})}
+          onBlur={e=>saveIdentity({display_name:e.target.value})}/>
+        <label style={{...S.label,marginTop:'12px'}}>Headline (optional)</label>
+        <input style={S.input} value={identity?.headline||''} placeholder="Senior Software Engineer"
+          onChange={e=>setIdentity({...identity,headline:e.target.value})}
+          onBlur={e=>saveIdentity({headline:e.target.value})}/>
+        <div style={{display:'flex',gap:'8px',marginTop:'14px',flexWrap:'wrap'}}>
+          <span style={S.tag(identity?.verified)} onClick={()=>saveIdentity({verified:!identity?.verified})}>
+            {identity?.verified?'✓ Badge on':'Badge off'}</span>
+          {['round-robin','random'].map(s=><span key={s} style={S.tag(identity?.handle_strategy===s)} onClick={()=>saveIdentity({handle_strategy:s})}>{s}</span>)}
+        </div>
+        <div style={{fontSize:'11px',color:'var(--text-dim)',marginTop:'8px'}}>The badge sits next to your real name on a joke handle, so it reads as a verified account that doesn't exist. Off is the safer default.</div>
+      </div>
+
+      <div style={S.card}><label style={S.label}>Handle pool ({handles.filter(h=>h.enabled).length} active)</label>
+        <div style={{display:'flex',gap:'8px',marginBottom:'12px'}}>
+          <input style={S.input} value={newHandle} placeholder="@BugWhisperer" onChange={e=>setNewHandle(e.target.value)} onKeyDown={e=>e.key==='Enter'&&addHandle()}/>
+          <button style={S.btn('ghost')} onClick={addHandle}>+ Add</button>
+        </div>
+        {!handles.length&&<button style={{...S.btn('ghost'),width:'100%',justifyContent:'center'}} onClick={seed}>Add the starter handles</button>}
+        <div style={{display:'flex',flexDirection:'column',gap:'6px'}}>
+          {handles.map(h=><div key={h.id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'8px 12px',borderRadius:'8px',background:'var(--bg-input)',opacity:h.enabled?1:0.45}}>
+            <span style={{fontSize:'13px'}}>{h.handle}</span>
+            <span style={{display:'flex',alignItems:'center',gap:'10px'}}>
+              <span style={{fontSize:'11px',color:'var(--text-dim)'}}>used {h.use_count}×</span>
+              <span style={{cursor:'pointer',fontSize:'12px'}} onClick={()=>toggleHandle(h.id,!h.enabled)}>{h.enabled?'⏸':'▶'}</span>
+              <span style={{cursor:'pointer',color:'var(--danger)'}} onClick={()=>delHandle(h.id)}>✕</span>
+            </span>
+          </div>)}
+        </div>
+      </div>
+    </div>
+
+    <div style={S.col}>
+      <div style={S.card}><label style={S.label}>Inspiration styles ({presets.length})</label>
+        <button style={{...S.btn('ghost'),width:'100%',justifyContent:'center',marginBottom:'10px'}} onClick={()=>inspoRef.current?.click()} disabled={busy==='inspo'}>{busy==='inspo'?'⏳ Analyzing...':'📁 Upload inspiration images'}</button>
+        <input ref={inspoRef} type="file" accept="image/*" multiple style={{display:'none'}} onChange={onInspo}/>
+        <div style={{fontSize:'11px',color:'var(--text-dim)',marginBottom:'12px'}}>Each image is read once to extract its palette, emphasis style and layout, then saved as a reusable preset. Nothing is trained — generation reads the preset, not the image.</div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'10px'}}>
+          {presets.map(p=><div key={p.id} style={{borderRadius:'10px',overflow:'hidden',border:'1px solid var(--border)',background:'var(--bg-input)'}}>
+            {p.source_url&&<img src={p.source_url} alt="" style={{width:'100%',height:'96px',objectFit:'cover',display:'block'}}/>}
+            <div style={{padding:'8px 10px'}}>
+              <div style={{fontSize:'12px',fontWeight:600,marginBottom:'4px'}}>{p.name||p.archetype}</div>
+              <div style={{display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+                <span style={S.badge('#6366F1')}>{p.archetype}</span>
+                <span style={{display:'flex',alignItems:'center',gap:'6px'}}>
+                  <span style={{width:'14px',height:'14px',borderRadius:'4px',background:p.style?.accent_color||'#999',display:'inline-block'}}/>
+                  <span style={{cursor:'pointer',color:'var(--danger)',fontSize:'12px'}} onClick={()=>delPreset(p.id)}>✕</span>
+                </span>
+              </div>
+            </div>
+          </div>)}
+        </div>
+        {!presets.length&&<div style={{fontSize:'12px',color:'var(--text-dim)',textAlign:'center',padding:'14px 0'}}>No presets yet — built-in defaults will be used.</div>}
+      </div>
+
+      <div style={S.card}><label style={S.label}>Preview a card</label>
+        <div style={{display:'flex',flexWrap:'wrap',gap:'6px',marginBottom:'10px'}}>
+          <span style={S.tag(!testArch,'#71717A')} onClick={()=>setTestArch('')}>🔍 Let AI choose</span>
+          {archetypes.map(a=><span key={a.id} style={S.tag(testArch===a.id)} onClick={()=>setTestArch(a.id)} title={a.description}>{a.label}</span>)}
+        </div>
+        <textarea style={{...S.textarea,minHeight:'90px'}} placeholder="Paste a post to see the image it would get..." value={testText} onChange={e=>setTestText(e.target.value)}/>
+        <button style={{...S.btn(),width:'100%',justifyContent:'center',marginTop:'10px'}} onClick={runTest} disabled={busy==='test'}>{busy==='test'?'⏳ Rendering...':'🖼️ Generate preview'}</button>
+        {testImg&&<div style={{marginTop:'12px'}}>
+          <img src={testImg.url} alt="" style={{width:'100%',borderRadius:'10px',display:'block'}}/>
+          <div style={{fontSize:'11px',color:'var(--text-dim)',marginTop:'6px'}}>{testImg.archetype}{testImg.handle?` · ${testImg.handle}`:''}{testImg.reason?` · ${testImg.reason}`:''}</div>
+        </div>}
+      </div>
+    </div>
+  </div>);
+}
+
 // ─── Main (state persisted across tabs) ──────────────────────────
 export default function App(){
   // Read initial tab from URL hash (e.g. #settings, #content)
   const getTabFromHash = () => {
     const hash = window.location.hash.replace('#','').split('?')[0];
-    const valid = ['generate','content','style','hooks','carousel','comments','repurpose','settings'];
+    const valid = ['generate','content','style','images','hooks','carousel','comments','repurpose','settings'];
     return valid.includes(hash) ? hash : 'generate';
   };
   const [tab,setTab]=useState(getTabFromHash);
@@ -210,13 +396,14 @@ export default function App(){
   }, []);
 
   useEffect(()=>{(async()=>{try{await api.health();setConfig(await api.getConfig());setConnected(true)}catch{setConnected(false)}})()},[]);
-  const tabs=[{id:'generate',l:'✨ Generate'},{id:'content',l:'📝 Content'},{id:'style',l:'🎨 Style'},{id:'hooks',l:'🎯 Hooks'},{id:'carousel',l:'📑 Carousel'},{id:'comments',l:'💬 Comments'},{id:'repurpose',l:'🔄 Repurpose'},{id:'settings',l:'⚙️ Settings'}];
+  const tabs=[{id:'generate',l:'✨ Generate'},{id:'content',l:'📝 Content'},{id:'style',l:'🎨 Style'},{id:'images',l:'🖼️ Images'},{id:'hooks',l:'🎯 Hooks'},{id:'carousel',l:'📑 Carousel'},{id:'comments',l:'💬 Comments'},{id:'repurpose',l:'🔄 Repurpose'},{id:'settings',l:'⚙️ Settings'}];
   return(<div style={{fontFamily:font,minHeight:'100vh',background:'var(--bg)',color:'var(--text)'}}>
     <header style={{maxWidth:'1200px',margin:'0 auto',padding:'20px 24px 16px',display:'flex',alignItems:'center',justifyContent:'space-between',borderBottom:'1px solid var(--border)',flexWrap:'wrap',gap:'12px'}}><div style={{display:'flex',alignItems:'center',gap:'12px'}}><div style={{width:'36px',height:'36px',borderRadius:'10px',background:'var(--accent)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'16px',fontWeight:700,color:'#fff'}}>LP</div><div><div style={{fontSize:'17px',fontWeight:700,letterSpacing:'-0.3px'}}>LinkedIn Post Generator</div><div style={{fontSize:'11px',color:'var(--text-dim)'}}>{connected===true&&<span style={{color:'var(--success)'}}>● Connected</span>}{connected===false&&<span style={{color:'var(--danger)'}}>● Backend offline</span>}</div></div></div><nav style={{display:'flex',gap:'3px',background:'var(--bg-input)',borderRadius:'10px',padding:'3px',flexWrap:'wrap'}}>{tabs.map(t=><button key={t.id} onClick={()=>switchTab(t.id)} style={{padding:'6px 12px',borderRadius:'8px',border:'none',cursor:'pointer',fontSize:'12px',fontWeight:500,fontFamily:font,background:tab===t.id?'var(--accent-bg)':'transparent',color:tab===t.id?'var(--accent)':'var(--text-muted)',whiteSpace:'nowrap'}}>{t.l}</button>)}</nav></header>
     <main style={{maxWidth:'1200px',margin:'0 auto',padding:'24px'}}>{connected===false?(<div style={{...S.card,textAlign:'center',padding:'60px 24px'}}><div style={{fontSize:'48px',marginBottom:'16px'}}>🔌</div><div style={{fontSize:'18px',fontWeight:600,marginBottom:'8px'}}>Backend not running</div><pre style={{background:'var(--bg-input)',padding:'14px',borderRadius:'10px',marginTop:'12px',fontSize:'13px',textAlign:'left',border:'1px solid var(--border)',overflow:'auto',display:'inline-block'}}>{`cd backend\npip install -r requirements.txt\ncp .env.example .env\npython -m uvicorn api.main:app --reload`}</pre></div>):connected===null?<Loader text="Connecting..."/>:<>
       {tab==='generate'&&<GenerateTab config={config} toast={toast} genState={genState} setGenState={setGenState}/>}
       {tab==='content'&&<ContentTab config={config} toast={toast}/>}
       {tab==='style'&&<StyleTab config={config} toast={toast}/>}
+      {tab==='images'&&<ImagesTab toast={toast}/>}
       {tab==='hooks'&&<HooksTab toast={toast}/>}
       {tab==='carousel'&&<CarouselTab toast={toast}/>}
       {tab==='comments'&&<CommentsTab toast={toast}/>}

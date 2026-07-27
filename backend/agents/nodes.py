@@ -148,24 +148,63 @@ async def draft_post(state: PostGenerationState) -> dict:
     system_prompt = f"""You are a LinkedIn ghostwriter for a Senior Software Development Engineer
 with 12+ years of experience.
 
-RULES:
-1. Write ONLY the post content. No titles, no metadata.
-2. Start with a strong hook (first 2 lines = "see more" trigger)
-3. Match the user's writing style if provided
-4. Include specific numbers, examples, or code when relevant
-5. End with a question or CTA to drive comments
-6. Add 3-4 hashtags at the end
-7. Keep under 250 words
-8. NO external links (LinkedIn suppresses them)
-9. Short paragraphs, use line breaks
-10. Write as a peer, NOT a teacher"""
+NEVER INVENT THE AUTHOR'S EXPERIENCE. This is the rule that matters most.
+You do not know what this person did last week, what they shipped, who they
+work for, what their team decided, or what results they measured. Writing
+"I ripped out X last week and shipped 3x faster" when it never happened puts a
+fabricated claim under their real name in front of their colleagues.
+
+So do not write:
+- invented incidents ("Last week I...", "A junior on my team asked me...")
+- invented metrics ("shipped 3x faster", "cut latency by 40%", "200 lines")
+- invented employers, projects, teams, timelines, or conversations
+
+The ONLY personal experience you may reference is what actually appears in the
+user's past posts shown below. Everything else must be framed as observation,
+analysis, or a general pattern. Use framings like:
+- "A pattern I keep seeing in production systems..."
+- "Teams often reach for X when Y would do."
+- "If you've ever debugged this, you know..."
+- "Here's what actually happens when..."
+
+Claims about the technology itself should be true and current. Any figure you
+cite must come from the research section below and be attributed there.
+
+FORMATTING:
+1. Write ONLY the post content. No titles, no metadata, no preamble.
+2. NO markdown. LinkedIn renders it literally, so **bold** appears as asterisks
+   on screen. For emphasis use line breaks, capitals sparingly, or "→".
+3. Short paragraphs with line breaks between them.
+4. NO external links — LinkedIn suppresses reach on them.
+
+CRAFT:
+5. Open with a hook in the first two lines; that is the "see more" cut-off.
+6. Match the user's writing style if one is provided.
+7. Prefer a concrete technical example, a comparison, or real code over a story.
+8. End with a question or CTA that invites a genuine answer.
+9. Add 3-4 hashtags at the end, only where they aid discovery.
+10. Keep under 250 words.
+11. Write as a peer, not a teacher."""
+
+    # "Story" is the format most likely to tip the model into inventing an
+    # anecdote, so it gets an explicit reminder of where a story may come from.
+    format_ctx = ""
+    if state.get("format") in ("story", "reflection"):
+        format_ctx = (
+            "\n## Note on this format:\n"
+            "A story or reflection must be built from the user's past posts above, "
+            "or told as a general pattern observed across teams. If you have no real "
+            "material for a first-person narrative, write it as analysis instead — "
+            "that is always better than inventing an incident.\n"
+        )
 
     user_prompt = f"""Topic: {state.get('selected_topic', '')}
 Category: {state.get('category', '')}
 Format: {state.get('format', 'story')}
 Tone: {state.get('tone', 'Conversational')}
-{research_ctx}{style_ctx}{past_ctx}{insp_ctx}{rules_ctx}{revision_ctx}
-Write the post now."""
+{research_ctx}{style_ctx}{past_ctx}{insp_ctx}{format_ctx}{rules_ctx}{revision_ctx}
+Write the post now. Every factual claim must be either true of the technology or
+drawn from the material above. Invent nothing about the author."""
 
     try:
         content = await llm_service.call_heavy(system_prompt, user_prompt)
@@ -218,6 +257,37 @@ async def quality_check(state: PostGenerationState) -> dict:
     updates["final_title"] = state.get("draft_title", "")
     updates["status"] = "completed"
     return updates
+
+
+async def decide_visual(state: PostGenerationState) -> dict:
+    """Judge whether the finished post deserves an image, and write its content.
+
+    Runs after the post is final so the decision is made on what was actually
+    written. Never fails the pipeline — a post without an image is fine, a
+    pipeline that dies trying to make one is not.
+    """
+    if state.get("status") == "failed":
+        return {}
+
+    post = state.get("final_post") or state.get("draft_content", "")
+    if not post:
+        return {}
+
+    from services.visual_agent import visual_agent
+
+    try:
+        plan = await visual_agent.plan(
+            post, state.get("category", ""), state.get("format", "")
+        )
+    except Exception as exc:
+        return {"wants_image": False, "image_reason": f"Visual step skipped: {str(exc)[:150]}"}
+
+    return {
+        "wants_image": plan.get("needs_image", False),
+        "image_archetype": plan.get("archetype", ""),
+        "image_reason": plan.get("reason", ""),
+        "image_payload": plan.get("payload", {}),
+    }
 
 
 def should_revise(state: PostGenerationState) -> str:

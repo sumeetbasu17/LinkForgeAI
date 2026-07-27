@@ -84,10 +84,65 @@ class Database:
                     updated_at TEXT NOT NULL
                 );
 
+                -- ─── Post images ──────────────────────────────────
+
+                -- Who the generated card claims to be: real name and photo,
+                -- plus how the badge is shown.
+                CREATE TABLE IF NOT EXISTS image_identity (
+                    user_id TEXT PRIMARY KEY DEFAULT 'default',
+                    display_name TEXT DEFAULT '',
+                    headline TEXT DEFAULT '',
+                    avatar_path TEXT DEFAULT '',
+                    verified INTEGER DEFAULT 0,
+                    verified_color TEXT DEFAULT '#1D9BF0',
+                    handle_strategy TEXT DEFAULT 'round-robin',
+                    updated_at TEXT NOT NULL
+                );
+
+                -- Rotating pool of handles. use_count and last_used_at drive
+                -- round-robin so the same handle doesn't repeat back to back.
+                CREATE TABLE IF NOT EXISTS image_handles (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT 'default',
+                    handle TEXT NOT NULL,
+                    enabled INTEGER DEFAULT 1,
+                    use_count INTEGER DEFAULT 0,
+                    last_used_at TEXT DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+
+                -- Style extracted from an uploaded inspiration image, stored
+                -- once and reused as a template preset.
+                CREATE TABLE IF NOT EXISTS image_presets (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT 'default',
+                    name TEXT DEFAULT '',
+                    archetype TEXT NOT NULL DEFAULT 'social-card',
+                    style TEXT NOT NULL DEFAULT '{}',
+                    source_image TEXT DEFAULT '',
+                    enabled INTEGER DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS post_images (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT 'default',
+                    post_id TEXT DEFAULT '',
+                    archetype TEXT NOT NULL,
+                    preset_id TEXT DEFAULT '',
+                    handle TEXT DEFAULT '',
+                    payload TEXT NOT NULL DEFAULT '{}',
+                    file_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_posts_user ON posts(user_id);
                 CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status);
                 CREATE INDEX IF NOT EXISTS idx_posts_category ON posts(category);
                 CREATE INDEX IF NOT EXISTS idx_style_posts_user ON style_posts(user_id);
+                CREATE INDEX IF NOT EXISTS idx_image_handles_user ON image_handles(user_id);
+                CREATE INDEX IF NOT EXISTS idx_image_presets_user ON image_presets(user_id);
+                CREATE INDEX IF NOT EXISTS idx_post_images_post ON post_images(post_id);
             """
             )
 
@@ -190,6 +245,20 @@ class Database:
 
     # ─── User Preferences ────────────────────────────────────────
 
+    def count_published_since(self, user_id: str, since_iso: str) -> int:
+        """How many posts this user has published since a point in time.
+
+        Backs the weekly cap, so autonomous mode can never post more than the
+        user allowed however many days they selected.
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS n FROM posts
+                   WHERE user_id = ? AND status = 'published' AND created_at >= ?""",
+                (user_id, since_iso),
+            ).fetchone()
+            return int(row["n"]) if row else 0
+
     def get_preferences(self, user_id: str = "default") -> dict:
         with self._conn() as conn:
             row = conn.execute(
@@ -285,6 +354,15 @@ class Database:
         with self._conn() as conn:
             rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
+
+    def update_style_post_category(self, post_id: str, category: str) -> bool:
+        """Set the category on an existing style post."""
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "UPDATE style_posts SET category = ? WHERE id = ?",
+                (category, post_id),
+            )
+            return cursor.rowcount > 0
 
     def delete_style_post(self, post_id: str) -> bool:
         """Delete a single style post."""
@@ -403,6 +481,276 @@ class Database:
                 token_data["days_remaining"] = days_left
 
             return token_data
+
+    # ─── Image identity ──────────────────────────────────────────
+
+    def get_image_identity(self, user_id: str = "default") -> dict:
+        """Identity shown on generated cards. Creates a default row on first use."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM image_identity WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            if row:
+                data = dict(row)
+                data["verified"] = bool(data.get("verified"))
+                return data
+
+            now = datetime.now().isoformat()
+            conn.execute(
+                """INSERT INTO image_identity
+                   (user_id, display_name, headline, avatar_path, verified,
+                    verified_color, handle_strategy, updated_at)
+                   VALUES (?, '', '', '', 0, '#1D9BF0', 'round-robin', ?)""",
+                (user_id, now),
+            )
+            return {
+                "user_id": user_id,
+                "display_name": "",
+                "headline": "",
+                "avatar_path": "",
+                "verified": False,
+                "verified_color": "#1D9BF0",
+                "handle_strategy": "round-robin",
+                "updated_at": now,
+            }
+
+    def update_image_identity(self, user_id: str = "default", **fields) -> dict:
+        """Update identity fields. Only known columns are written."""
+        self.get_image_identity(user_id)  # ensure the row exists
+        allowed = {
+            "display_name",
+            "headline",
+            "avatar_path",
+            "verified",
+            "verified_color",
+            "handle_strategy",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+        if updates:
+            if "verified" in updates:
+                updates["verified"] = 1 if updates["verified"] else 0
+            sets = ", ".join(f"{k} = ?" for k in updates)
+            params = list(updates.values()) + [datetime.now().isoformat(), user_id]
+            with self._conn() as conn:
+                conn.execute(
+                    f"UPDATE image_identity SET {sets}, updated_at = ? WHERE user_id = ?",
+                    params,
+                )
+        return self.get_image_identity(user_id)
+
+    # ─── Handle pool ─────────────────────────────────────────────
+
+    def list_image_handles(self, user_id: str = "default") -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM image_handles WHERE user_id = ? ORDER BY created_at",
+                (user_id,),
+            ).fetchall()
+            out = []
+            for r in rows:
+                d = dict(r)
+                d["enabled"] = bool(d.get("enabled"))
+                out.append(d)
+            return out
+
+    def add_image_handle(self, handle_id: str, handle: str, user_id: str = "default") -> dict:
+        handle = handle.strip()
+        if not handle.startswith("@"):
+            handle = "@" + handle
+        with self._conn() as conn:
+            existing = conn.execute(
+                "SELECT id FROM image_handles WHERE user_id = ? AND handle = ?",
+                (user_id, handle),
+            ).fetchone()
+            if existing:
+                return {"id": existing["id"], "handle": handle, "duplicate": True}
+            conn.execute(
+                """INSERT INTO image_handles
+                   (id, user_id, handle, enabled, use_count, last_used_at, created_at)
+                   VALUES (?, ?, ?, 1, 0, '', ?)""",
+                (handle_id, user_id, handle, datetime.now().isoformat()),
+            )
+        return {"id": handle_id, "handle": handle, "duplicate": False}
+
+    def set_image_handle_enabled(self, handle_id: str, enabled: bool) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE image_handles SET enabled = ? WHERE id = ?",
+                (1 if enabled else 0, handle_id),
+            )
+            return cur.rowcount > 0
+
+    def delete_image_handle(self, handle_id: str) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM image_handles WHERE id = ?", (handle_id,))
+            return cur.rowcount > 0
+
+    def pick_image_handle(self, user_id: str = "default", strategy: str = "round-robin") -> str:
+        """Choose the next handle and record the use.
+
+        Round-robin picks the least-used handle, breaking ties by the oldest
+        last use, so a handle never repeats while others are still unused.
+        """
+        import random
+
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM image_handles WHERE user_id = ? AND enabled = 1",
+                (user_id,),
+            ).fetchall()
+            if not rows:
+                return ""
+
+            handles = [dict(r) for r in rows]
+            if strategy == "random":
+                chosen = random.choice(handles)
+            else:
+                chosen = sorted(
+                    handles,
+                    key=lambda h: (h.get("use_count") or 0, h.get("last_used_at") or ""),
+                )[0]
+
+            conn.execute(
+                "UPDATE image_handles SET use_count = use_count + 1, last_used_at = ? WHERE id = ?",
+                (datetime.now().isoformat(), chosen["id"]),
+            )
+            return chosen["handle"]
+
+    # ─── Style presets ───────────────────────────────────────────
+
+    def add_image_preset(
+        self,
+        preset_id: str,
+        archetype: str,
+        style: dict,
+        name: str = "",
+        source_image: str = "",
+        user_id: str = "default",
+    ) -> dict:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO image_presets
+                   (id, user_id, name, archetype, style, source_image, enabled, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
+                (
+                    preset_id,
+                    user_id,
+                    name,
+                    archetype,
+                    json.dumps(style),
+                    source_image,
+                    datetime.now().isoformat(),
+                ),
+            )
+        return {"id": preset_id, "archetype": archetype, "style": style}
+
+    def list_image_presets(
+        self, user_id: str = "default", archetype: Optional[str] = None
+    ) -> list[dict]:
+        query = "SELECT * FROM image_presets WHERE user_id = ?"
+        params: list = [user_id]
+        if archetype:
+            query += " AND archetype = ?"
+            params.append(archetype)
+        query += " ORDER BY created_at DESC"
+
+        with self._conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+
+        presets = []
+        for r in rows:
+            d = dict(r)
+            d["enabled"] = bool(d.get("enabled"))
+            try:
+                d["style"] = json.loads(d.get("style") or "{}")
+            except json.JSONDecodeError:
+                d["style"] = {}
+            presets.append(d)
+        return presets
+
+    def delete_image_preset(self, preset_id: str) -> Optional[dict]:
+        """Delete a preset and return it, so the caller can clean up its file."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM image_presets WHERE id = ?", (preset_id,)
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute("DELETE FROM image_presets WHERE id = ?", (preset_id,))
+            return dict(row)
+
+    # ─── Generated images ────────────────────────────────────────
+
+    def add_post_image(
+        self,
+        image_id: str,
+        archetype: str,
+        file_path: str,
+        post_id: str = "",
+        preset_id: str = "",
+        handle: str = "",
+        payload: Optional[dict] = None,
+        user_id: str = "default",
+    ) -> dict:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO post_images
+                   (id, user_id, post_id, archetype, preset_id, handle, payload,
+                    file_path, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    image_id,
+                    user_id,
+                    post_id,
+                    archetype,
+                    preset_id,
+                    handle,
+                    json.dumps(payload or {}),
+                    file_path,
+                    datetime.now().isoformat(),
+                ),
+            )
+        return {"id": image_id, "archetype": archetype, "file_path": file_path}
+
+    def get_post_images(self, post_id: str) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM post_images WHERE post_id = ? ORDER BY created_at DESC",
+                (post_id,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["payload"] = json.loads(d.get("payload") or "{}")
+            except json.JSONDecodeError:
+                d["payload"] = {}
+            out.append(d)
+        return out
+
+    def get_post_image(self, image_id: str) -> Optional[dict]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM post_images WHERE id = ?", (image_id,)
+            ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["payload"] = json.loads(d.get("payload") or "{}")
+        except json.JSONDecodeError:
+            d["payload"] = {}
+        return d
+
+    def delete_post_image(self, image_id: str) -> Optional[dict]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM post_images WHERE id = ?", (image_id,)
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute("DELETE FROM post_images WHERE id = ?", (image_id,))
+            return dict(row)
 
 
 # Singleton

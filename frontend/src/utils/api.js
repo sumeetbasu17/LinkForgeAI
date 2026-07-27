@@ -52,6 +52,10 @@ const api = {
     fd.append('user_id', userId);
     return request('/style/upload', { method: 'POST', body: fd });
   },
+  recategorizeStylePosts: (p = {}) => {
+    const q = new URLSearchParams(p).toString();
+    return request(`/style/recategorize${q ? '?' + q : ''}`, { method: 'POST' });
+  },
   analyzeStyle: (uid = 'default') => request('/style/analyze', { method: 'POST', body: { user_id: uid } }),
   getStyleProfile: (uid = 'default') => request(`/style/profile?user_id=${uid}`),
 
@@ -66,6 +70,41 @@ const api = {
   // Custom Rules
   getRules: (uid = 'default') => request(`/rules?user_id=${uid}`),
   updateRules: (rules, uid = 'default') => request(`/rules?rules=${encodeURIComponent(rules)}&user_id=${uid}`, { method: 'PUT' }),
+
+  // Scheduler
+  schedulerStatus: (uid = 'default') => request(`/scheduler/status?user_id=${uid}`),
+
+  // Post images
+  getImageConfig: () => request('/images/config'),
+  getImageIdentity: (uid = 'default') => request(`/images/identity?user_id=${uid}`),
+  updateImageIdentity: (d) => request('/images/identity', { method: 'PUT', body: d }),
+  uploadAvatar: (file, uid = 'default') => {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('user_id', uid);
+    return request('/images/avatar', { method: 'POST', body: fd });
+  },
+  addImageHandle: (handle, uid = 'default') =>
+    request('/images/handles', { method: 'POST', body: { handle, user_id: uid } }),
+  seedImageHandles: (uid = 'default') =>
+    request(`/images/handles/seed?user_id=${uid}`, { method: 'POST' }),
+  toggleImageHandle: (id, enabled) =>
+    request(`/images/handles/${id}?enabled=${enabled}`, { method: 'PUT' }),
+  deleteImageHandle: (id) => request(`/images/handles/${id}`, { method: 'DELETE' }),
+  listImagePresets: (p = {}) => {
+    const q = new URLSearchParams(p).toString();
+    return request(`/images/presets${q ? '?' + q : ''}`);
+  },
+  uploadInspirationImage: (file, uid = 'default') => {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('user_id', uid);
+    return request('/images/inspiration', { method: 'POST', body: fd });
+  },
+  deleteImagePreset: (id) => request(`/images/presets/${id}`, { method: 'DELETE' }),
+  generatePostImage: (d) => request('/images/generate', { method: 'POST', body: d }),
+  listPostImages: (postId) => request(`/images/post/${postId}`),
+  deletePostImage: (id) => request(`/images/${id}`, { method: 'DELETE' }),
 
   // Carousel
   generateCarousel: (d) => request('/carousel', { method: 'POST', body: d }),

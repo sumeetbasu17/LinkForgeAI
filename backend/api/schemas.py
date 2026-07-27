@@ -11,8 +11,9 @@ from typing import Optional
 class GeneratePostRequest(BaseModel):
     category: str = Field(..., description="Category ID like 'ai-engineering'")
     topic: str = Field("", description="Optional specific topic. AI picks if empty.")
-    format: str = Field("story", description="Post format: story, listicle, hot-take, tutorial, reflection, trend")
-    tone: str = Field("Conversational", description="Tone: Professional, Conversational, etc.")
+    # Blank means "use my settings". Anything sent here wins over settings.
+    format: str = Field("", description="Post format: story, listicle, hot-take, tutorial, reflection, trend. Blank uses default_format from preferences.")
+    tone: str = Field("", description="Tone: Professional, Conversational, etc. Blank uses the category's tone override, then default_tone.")
     user_id: str = Field("default", description="User identifier")
 
 
@@ -28,6 +29,14 @@ class GeneratePostResponse(BaseModel):
     research_summary: str = ""
     selected_topic: str = ""
     revision_count: int = 0
+
+    # Visual suggestion from the decide_visual node. The image is not rendered
+    # during generation — the Editor calls /api/images/generate so the user can
+    # accept, change, or drop it first.
+    wants_image: bool = False
+    image_archetype: str = ""
+    image_reason: str = ""
+    image_payload: dict = {}
 
 
 # ─── Posts CRUD ───────────────────────────────────────────────────
