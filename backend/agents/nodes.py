@@ -355,6 +355,18 @@ re-read the author's rules and check the draft against them line by line."""
 - Essay words nobody says out loud: judiciously, leverage, delve, myriad, robust, seamless, "in the realm of", "it's worth noting", "a match made in heaven".
 - Long, clause-packed sentences. Prefer short, declarative statements."""
 
+    # The two failures that survive everything else: the post opens with a
+    # definition instead of a situation, and it teaches four or five concepts
+    # instead of one. This is a hard pre-send checklist, placed last so it is the
+    # freshest instruction when the model starts writing.
+    self_check = """BEFORE YOU RETURN THE POST, check it against these. If any answer is no, rewrite it:
+1. OPENING: Does it open with a concrete situation, symptom, or scenario the reader recognises — NOT a definition and NOT a "X does this, Y does that" textbook comparison? Introduce the technical term only AFTER the reader can feel the problem it solves.
+2. ONE IDEA: Does it teach a single idea (two at most, and only if tightly linked)? If three or more named concepts show up (e.g. CQRS, Saga, eventual consistency, ACID, two-phase commit), keep the most important one and leave the rest for other posts.
+3. SPOKEN: Would you actually say these sentences out loud to another engineer over coffee? If a line sounds like documentation or a textbook, rewrite it as something you'd say.
+4. HONEST: Is every first-person line a genuine reflection ("I've noticed", "I still prefer"), never an invented incident, metric, team or timeline?
+5. ENDING: Does it close on an insight specific to THIS topic, not a reusable line that would fit any post ("complexity just moves", "it's all about balance")?
+Also: don't overstate. Avoid absolute claims like "X won't help you" or "X is useless"; where two patterns can coexist, say so."""
+
     system_prompt = f"""You are a LinkedIn ghostwriter for a Senior Software Development Engineer
 with 12+ years of experience.{rules_block}
 
@@ -384,7 +396,9 @@ cite must come from the research section below and be attributed there.
 
 {style_layer}
 
-{voice_tells}"""
+{voice_tells}
+
+{self_check}"""
 
     # "Story" is the format most likely to tip the model into inventing an
     # anecdote, so it gets an explicit reminder of where a story may come from.
@@ -435,8 +449,16 @@ async def quality_check(state: PostGenerationState) -> dict:
     revision_count = state.get("revision_count", 0)
     max_revisions = state.get("max_revisions", 2)
 
-    if style_score < 70 and revision_count < max_revisions:
-        rules = state.get("custom_rules", "")
+    rules = state.get("custom_rules", "")
+    # Vector similarity only measures resemblance to past posts; it can pass a
+    # draft that still opens like a textbook or crams in five concepts. So when
+    # the author has custom rules, always run the persona review at least once —
+    # not only when the similarity score is low.
+    review = revision_count < max_revisions and (
+        style_score < 70 or bool((rules or "").strip())
+    )
+
+    if review:
         # The reviewer is checked against the same rules the writer was given —
         # otherwise a rule-breaking draft can still pass the gate.
         rules_section = (
@@ -451,13 +473,29 @@ async def quality_check(state: PostGenerationState) -> dict:
             if examples
             else ""
         )
+        # The persona rubric, spelled out so the reviewer catches the two
+        # failures vector similarity misses: a definition-first opening and a
+        # post that teaches too many concepts at once.
+        rubric = (
+            "\n\nScore the draft against these five checks. Treat any check that "
+            "fails as a rule breach and set passes=false:\n"
+            "1. OPENING: opens with a concrete situation or symptom, not a "
+            "definition or a 'X does this, Y does that' textbook comparison.\n"
+            "2. ONE IDEA: teaches one idea (two at most if tightly linked). Three "
+            "or more named concepts is a fail.\n"
+            "3. SPOKEN: reads like something an engineer would say aloud, not like "
+            "documentation.\n"
+            "4. HONEST: no invented incidents, metrics, teams or timelines.\n"
+            "5. ENDING: closes on an insight specific to this topic, not a "
+            "reusable line that fits any post."
+        )
         try:
             feedback = await llm_service.call_structured(
-                "You review LinkedIn drafts against the author's own rules and voice. "
-                "Score and give actionable feedback.",
+                "You review LinkedIn drafts against the author's own rules, voice "
+                "and a persona rubric. Score strictly and give actionable feedback.",
                 f"""Draft:\n{state.get('draft_content', '')}\n\n"""
                 f"""Style profile:\n{state.get('style_profile', 'None')}"""
-                f"""{rules_section}{examples_section}\n\n"""
+                f"""{rules_section}{examples_section}{rubric}\n\n"""
                 """Return JSON: {"score": 0-100, "feedback": "2-3 sentences naming what to change", "passes": true/false, "rule_breaches": ["..."]}""",
                 light=True,
             )
@@ -516,12 +554,18 @@ async def decide_visual(state: PostGenerationState) -> dict:
 
 
 def should_revise(state: PostGenerationState) -> str:
-    """Conditional edge: 'revise' or 'finalize'."""
-    if state.get("status") == "failed":
+    """Conditional edge: 'revise' or 'finalize'.
+
+    Route on what quality_check actually produced, not on the score. When the
+    reviewer asks for a rewrite it returns without a final_post and with the
+    revision counter bumped; when it accepts the draft it sets final_post and
+    marks the run completed. Keying off the score here would miss a rewrite the
+    reviewer requested on a draft whose blended score still landed above 70.
+    """
+    if state.get("status") in ("failed", "completed"):
         return "finalize"
-    if state.get("status") == "completed":
+    if state.get("final_post"):
         return "finalize"
-    if state.get("style_score", 100) < 70 and state.get("revision_count", 0) <= state.get("max_revisions", 2):
-        if not state.get("final_post"):
-            return "revise"
+    if state.get("revision_count", 0) <= state.get("max_revisions", 2):
+        return "revise"
     return "finalize"
