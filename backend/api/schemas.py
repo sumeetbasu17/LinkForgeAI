@@ -114,6 +114,9 @@ class PreferencesUpdate(BaseModel):
     preferred_days: Optional[list[str]] = None
     preferred_time: Optional[str] = None
     auto_post_enabled: Optional[bool] = None
+    # Minutes after preferred_time during which a post may still be published.
+    # Past it the scheduler saves a draft rather than posting hours late.
+    catch_up_minutes: Optional[int] = Field(None, ge=0, le=720)
 
 
 class PreferencesResponse(BaseModel):
@@ -126,6 +129,7 @@ class PreferencesResponse(BaseModel):
     preferred_days: list[str]
     preferred_time: str
     auto_post_enabled: bool = False
+    catch_up_minutes: int = 15
     style_profile: dict = {}
 
 

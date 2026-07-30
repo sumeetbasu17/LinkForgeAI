@@ -59,6 +59,7 @@ class Database:
                     style_profile TEXT DEFAULT '{}',
                     preferred_model TEXT DEFAULT '',
                     custom_rules TEXT DEFAULT '',
+                    catch_up_minutes INTEGER DEFAULT 15,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -71,6 +72,19 @@ class Database:
                     category TEXT DEFAULT '',
                     source_url TEXT DEFAULT '',
                     created_at TEXT NOT NULL
+                );
+
+                -- One row per scheduler tick. The scheduler only runs while the
+                -- backend process is alive, so the *gaps* in this table are the
+                -- evidence for "why didn't my 9:00 AM post go out at 9:00".
+                CREATE TABLE IF NOT EXISTS scheduler_ticks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL DEFAULT 'default',
+                    at TEXT NOT NULL,
+                    action TEXT NOT NULL DEFAULT 'none',
+                    reason TEXT DEFAULT '',
+                    target_time TEXT DEFAULT '',
+                    late_minutes INTEGER DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS linkedin_tokens (
@@ -143,8 +157,33 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_image_handles_user ON image_handles(user_id);
                 CREATE INDEX IF NOT EXISTS idx_image_presets_user ON image_presets(user_id);
                 CREATE INDEX IF NOT EXISTS idx_post_images_post ON post_images(post_id);
+                CREATE INDEX IF NOT EXISTS idx_ticks_at ON scheduler_ticks(at);
             """
             )
+        self._add_missing_columns()
+
+    # Columns added after the first release. CREATE TABLE IF NOT EXISTS does
+    # nothing to a database that already exists, so new columns are added here.
+    _LATE_COLUMNS = {
+        "user_preferences": {
+            "preferred_model": "TEXT DEFAULT ''",
+            "custom_rules": "TEXT DEFAULT ''",
+            # Minutes after the preferred time during which a post may still be
+            # published. Past it the post is saved as a draft instead of going
+            # out hours late.
+            "catch_up_minutes": "INTEGER DEFAULT 15",
+        },
+    }
+
+    def _add_missing_columns(self):
+        with self._conn() as conn:
+            for table, columns in self._LATE_COLUMNS.items():
+                existing = {
+                    r["name"] for r in conn.execute(f"PRAGMA table_info({table})")
+                }
+                for name, ddl in columns.items():
+                    if name not in existing:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     @contextmanager
     def _conn(self):
@@ -259,6 +298,73 @@ class Database:
             ).fetchone()
             return int(row["n"]) if row else 0
 
+    def count_posts_today(
+        self,
+        user_id: str = "default",
+        status: Optional[str] = None,
+        id_prefix: Optional[str] = None,
+        day: Optional[str] = None,
+    ) -> int:
+        """How many posts were created today, optionally by status or id prefix.
+
+        The scheduler uses this twice: to avoid publishing twice in a day, and
+        to avoid saving a fresh "missed the slot" draft on every 10-minute tick.
+        """
+        day = day or datetime.now().strftime("%Y-%m-%d")
+        query = "SELECT COUNT(*) AS n FROM posts WHERE user_id = ? AND created_at LIKE ?"
+        params: list = [user_id, f"{day}%"]
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        if id_prefix:
+            query += " AND id LIKE ?"
+            params.append(f"{id_prefix}%")
+        with self._conn() as conn:
+            row = conn.execute(query, params).fetchone()
+            return int(row["n"]) if row else 0
+
+    # ─── Scheduler ticks ─────────────────────────────────────────
+
+    def record_scheduler_tick(
+        self,
+        user_id: str = "default",
+        action: str = "none",
+        reason: str = "",
+        target_time: str = "",
+        late_minutes: int = 0,
+        keep: int = 500,
+    ) -> None:
+        """Log one scheduler evaluation, trimming old rows."""
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO scheduler_ticks
+                   (user_id, at, action, reason, target_time, late_minutes)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    user_id,
+                    datetime.now().isoformat(timespec="seconds"),
+                    action,
+                    reason,
+                    target_time,
+                    int(late_minutes),
+                ),
+            )
+            conn.execute(
+                """DELETE FROM scheduler_ticks WHERE id NOT IN
+                   (SELECT id FROM scheduler_ticks ORDER BY id DESC LIMIT ?)""",
+                (keep,),
+            )
+
+    def list_scheduler_ticks(self, user_id: str = "default", limit: int = 20) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT at, action, reason, target_time, late_minutes
+                   FROM scheduler_ticks WHERE user_id = ?
+                   ORDER BY id DESC LIMIT ?""",
+                (user_id, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def get_preferences(self, user_id: str = "default") -> dict:
         with self._conn() as conn:
             row = conn.execute(
@@ -293,6 +399,7 @@ class Database:
                 "style_profile": {},
                 "preferred_model": "",
                 "custom_rules": "",
+                "catch_up_minutes": 15,
                 "created_at": now,
                 "updated_at": now,
             }

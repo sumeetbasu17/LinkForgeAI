@@ -620,6 +620,14 @@ async def update_preferences(update: PreferencesUpdate, user_id: str = "default"
         update_data["auto_post_enabled"] = int(update_data["auto_post_enabled"])
 
     database.update_preferences(user_id, **update_data)
+
+    # Changing the day or the time must move the exact-time job, not wait for a
+    # restart to pick it up.
+    if {"preferred_days", "preferred_time"} & set(update_data):
+        from services import scheduler as sched
+
+        sched.sync_slot_job(user_id)
+
     return await get_preferences(user_id)
 
 
@@ -817,6 +825,7 @@ async def publish_to_linkedin(req: LinkedInPostRequest):
     """Publish a post to your personal LinkedIn profile."""
     content = req.content
     post_id = req.post_id
+    post = None
 
     if post_id:
         post = database.get_post(post_id)
@@ -827,8 +836,27 @@ async def publish_to_linkedin(req: LinkedInPostRequest):
     if not content:
         raise HTTPException(status_code=400, detail="Provide post_id or content")
 
+    # If a card was rendered for this post, publish it with the post. Without
+    # this, an image generated in the Editor was simply left behind.
+    image_path = ""
+    if post_id:
+        images = database.get_post_images(post_id)
+        if images and _Path(images[0].get("file_path", "")).exists():
+            image_path = images[0]["file_path"]
+
     # Publish FIRST, then update status only on success
-    result = await linkedin_service.create_text_post(content)
+    if image_path:
+        result = await linkedin_service.create_image_post(
+            content, image_path, alt_text=(post or {}).get("title", "")
+        )
+        if result["status"] == "failed":
+            # An upload problem should not block the post itself.
+            logger.warning(
+                f"Image post failed ({result.get('message')}) — publishing text only"
+            )
+            result = await linkedin_service.create_text_post(content)
+    else:
+        result = await linkedin_service.create_text_post(content)
 
     if result["status"] == "failed":
         raise HTTPException(status_code=500, detail=result.get("message", "Posting failed"))
@@ -848,8 +876,9 @@ from pathlib import Path as _Path
 
 from services import image_templates
 from services.image_renderer import image_renderer, media_dir, RendererUnavailable
+from services import image_pipeline
 from services.image_style import image_style_analyzer
-from services.visual_agent import visual_agent
+from services.visual_agent import visual_agent, infer_archetype
 
 # Handles suggested on first run — the user edits these in the Images tab.
 STARTER_HANDLES = [
@@ -907,10 +936,14 @@ async def scheduler_status(user_id: str = "default"):
 
     prefs = database.get_preferences(user_id)
     decision = sched.evaluate(prefs)
+    ticks = database.list_scheduler_ticks(user_id, limit=30)
     return {
         **decision,
         "job": sched.scheduler_info(),
         "last_tick": sched.last_tick(),
+        # The tick history makes a missed slot explainable: the scheduler only
+        # runs while this backend is up, so a gap means it was not running.
+        "recent_ticks": ticks,
         "linkedin_connected": bool(database.get_linkedin_token(user_id)),
     }
 
@@ -1131,66 +1164,42 @@ async def generate_post_image(req: ImageGenerateRequest):
         except Exception as e:
             raise HTTPException(status_code=502, detail=str(e)[:300])
 
+    # A payload can arrive without its archetype (the Editor forwards a saved
+    # payload but leaves archetype blank). Recover it from the payload's shape
+    # so a diagram payload isn't rendered through the social-card template.
+    if not archetype:
+        archetype = infer_archetype(payload)
+
     archetype = archetype or "social-card"
 
-    # Pick the style preset: the requested one, else any learned preset for
-    # this archetype, else the built-in defaults.
-    style = None
-    preset_id = req.preset_id
-    presets = database.list_image_presets(req.user_id)
-    if preset_id:
-        match = next((p for p in presets if p["id"] == preset_id), None)
-        if not match:
-            raise HTTPException(status_code=404, detail="Preset not found")
-        style = match["style"]
-    else:
-        match = next(
-            (p for p in presets if p["archetype"] == archetype and p["enabled"]), None
-        )
-        if match:
-            style = match["style"]
-            preset_id = match["id"]
-
-    identity = database.get_image_identity(req.user_id)
-
-    # Only the person-shaped cards carry a handle.
-    handle = ""
-    if archetype in ("social-card", "interview-card"):
-        handle = req.handle or database.pick_image_handle(
-            req.user_id, identity.get("handle_strategy", "round-robin")
-        )
-
+    # Same code path the scheduler uses, so an auto-published post is rendered
+    # with the same preset, handle rotation and identity as a manual one.
     try:
-        path = await image_renderer.render_card(
-            archetype, payload, style, identity, handle
+        record = await image_pipeline.render_for_post(
+            archetype=archetype,
+            payload=payload,
+            user_id=req.user_id,
+            post_id=req.post_id,
+            preset_id=req.preset_id,
+            handle=req.handle,
         )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Preset not found")
     except RendererUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Render failed: {str(e)[:300]}")
 
-    image_id = f"img_{uuid.uuid4().hex[:10]}"
-    database.add_post_image(
-        image_id=image_id,
-        archetype=archetype,
-        file_path=str(path),
-        post_id=req.post_id,
-        preset_id=preset_id,
-        handle=handle,
-        payload=payload,
-        user_id=req.user_id,
-    )
-
     return {
         "generated": True,
-        "id": image_id,
-        "archetype": archetype,
-        "handle": handle,
-        "preset_id": preset_id,
-        "payload": payload,
+        "id": record["id"],
+        "archetype": record["archetype"],
+        "handle": record["handle"],
+        "preset_id": record["preset_id"],
+        "payload": record["payload"],
         "reason": reason,
-        "url": f"/api/images/file/{path.name}",
-        "message": f"{archetype} generated",
+        "url": record["url"],
+        "message": f"{record['archetype']} generated",
     }
 
 

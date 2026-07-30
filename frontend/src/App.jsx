@@ -77,7 +77,7 @@ function GenerateTab({config,toast,genState,setGenState}){
                 ?<>Suggested image: <b style={{color:'var(--text)'}}>{result.image_archetype}</b>{result.image_reason?` — ${result.image_reason}`:''}</>
                 :<>No image suggested{result.image_reason?` — ${result.image_reason}`:' — nothing concrete to show'}</>}
             </div>
-            {!postImg&&<button style={S.btn('ghost')} onClick={()=>makeImage(result.wants_image?'':'')} disabled={imgBusy}>{imgBusy?'⏳...':result.wants_image?'🖼️ Create image':'🖼️ Create anyway'}</button>}
+            {!postImg&&<button style={S.btn('ghost')} onClick={()=>makeImage('')} disabled={imgBusy}>{imgBusy?'⏳...':result.wants_image?'🖼️ Create image':'🖼️ Create anyway'}</button>}
           </div>
           {!postImg&&<div style={{display:'flex',flexWrap:'wrap',gap:'6px',marginTop:'10px'}}>
             {['social-card','interview-card','code-card','diagram'].map(a=><span key={a} style={S.tag(false)} onClick={()=>makeImage(a)}>{a}</span>)}
@@ -235,20 +235,25 @@ function SettingsTab({config,toast}){
           : <div style={{fontSize:'12px',color:'var(--text-dim)',marginTop:'10px'}}>A hard ceiling on autonomous posts per week, counted Monday to Sunday. Your {(prefs.preferred_days||[]).length} selected days sit within it.</div>}
       </div>
 
-      <div style={S.card}><label style={S.label}>Time</label><div style={{display:'flex',flexWrap:'wrap',gap:'8px'}}>{TIMES.map(t=><span key={t} style={S.tag(prefs.preferred_time===t,'#10B981')} onClick={()=>save({preferred_time:t})}>{t}</span>)}</div><div style={{marginTop:'12px',padding:'12px',borderRadius:'10px',background:'var(--success-bg)',fontSize:'13px',color:'var(--success)'}}>🎯 IST: 8-9 AM and 5-7 PM weekdays work best.</div></div>
+      <div style={S.card}><label style={S.label}>Time</label><div style={{display:'flex',flexWrap:'wrap',gap:'8px'}}>{TIMES.map(t=><span key={t} style={S.tag(prefs.preferred_time===t,'#10B981')} onClick={()=>save({preferred_time:t})}>{t}</span>)}</div><div style={{marginTop:'12px',padding:'12px',borderRadius:'10px',background:'var(--success-bg)',fontSize:'13px',color:'var(--success)'}}>🎯 IST: 8-9 AM and 5-7 PM weekdays work best.</div>
+        <label style={{...S.label,marginTop:'16px'}}>Publishing window</label>
+        <div style={{display:'flex',flexWrap:'wrap',gap:'8px'}}>{[15,30,60,120].map(m=><span key={m} style={S.tag((prefs.catch_up_minutes??15)===m,'#F59E0B')} onClick={()=>save({catch_up_minutes:m})}>+{m<60?`${m} min`:`${m/60} h`}</span>)}</div>
+        <div style={{fontSize:'12px',color:'var(--text-dim)',marginTop:'10px',lineHeight:1.6}}>The scheduler runs inside this app, so it can only check while the app is open. Inside {prefs.preferred_time} +{prefs.catch_up_minutes??15} min it publishes. Later than that it still writes the post but saves it as a <b>draft</b> instead of publishing hours off-schedule.</div></div>
 
       <div style={S.card}><div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}><div><div style={{fontSize:'14px',fontWeight:600}}>Autonomous mode</div><div style={{fontSize:'12px',color:'var(--text-dim)',marginTop:'2px'}}>Auto-generate and publish</div></div><div onClick={()=>save({auto_post_enabled:!prefs.auto_post_enabled})} style={{width:'46px',height:'26px',borderRadius:'13px',cursor:'pointer',background:prefs.auto_post_enabled?'var(--accent)':'var(--bg-input)',border:`1px solid ${prefs.auto_post_enabled?'var(--accent)':'var(--border)'}`,position:'relative',flexShrink:0}}><div style={{width:'20px',height:'20px',borderRadius:'10px',background:'#fff',position:'absolute',top:'2px',left:prefs.auto_post_enabled?'23px':'2px',transition:'left 0.2s'}}/></div></div>{prefs.auto_post_enabled?<div style={{marginTop:'10px',padding:'10px',borderRadius:'8px',background:'var(--accent-bg)',fontSize:'12px',color:'var(--accent)'}}>ON — posts auto-generated on your schedule. Turn OFF anytime to pause.</div>:<div style={{marginTop:'10px',padding:'10px',borderRadius:'8px',background:'var(--bg-input)',fontSize:'12px',color:'var(--text-dim)'}}>OFF — generate manually from Generate tab. Turn ON for hands-free posting.</div>}
         {schedStatus&&<div style={{marginTop:'10px',padding:'12px',borderRadius:'8px',background:'var(--bg-input)',border:'1px solid var(--border)',fontSize:'12px'}}>
           <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'6px'}}>
-            <span style={{fontWeight:600}}>Right now: {schedStatus.should_post?'would post':'would not post'}</span>
+            <span style={{fontWeight:600}}>Right now: {schedStatus.action==='publish'?'would publish':schedStatus.action==='draft'?'would save a draft':'would not post'}</span>
             <span style={{cursor:'pointer',color:'var(--accent)',fontSize:'11px'}} onClick={loadSched}>refresh</span>
           </div>
           <div style={{color:'var(--text-dim)',lineHeight:1.6}}>
             <div>{schedStatus.reason}</div>
-            {schedStatus.target_time&&<div>Window: {schedStatus.target_time.slice(11,16)} → {schedStatus.catch_up_until?.slice(11,16)} today</div>}
+            {schedStatus.target_time&&<div>Publish window: {schedStatus.target_time.slice(11,16)} → {schedStatus.publish_until?.slice(11,16)} today</div>}
             <div>This week: {schedStatus.published_this_week}/{schedStatus.weekly_cap||'∞'} published</div>
-            <div>Background job: {schedStatus.job?.running?`running, next check ${schedStatus.job.next_run?.slice(11,16)||'—'}`:'NOT RUNNING'}</div>
+            <div>Background job: {schedStatus.job?.running?`running, safety check ${schedStatus.job.next_run?.slice(11,16)||'—'}`:'NOT RUNNING'}</div>
+            <div>Next exact slot: {schedStatus.job?.next_slot?`${schedStatus.job.next_slot.slice(5,10)} ${schedStatus.job.next_slot.slice(11,16)}`:'not scheduled'}</div>
             <div>Last check: {schedStatus.last_tick?.at?`${schedStatus.last_tick.at.slice(11,16)} — ${schedStatus.last_tick.reason}`:'never'}</div>
+            {schedStatus.recent_ticks?.length>0&&<details style={{marginTop:'6px'}}><summary style={{cursor:'pointer',color:'var(--accent)'}}>Check history ({schedStatus.recent_ticks.length}) — gaps mean the app was closed</summary><div style={{marginTop:'6px',maxHeight:'160px',overflowY:'auto',display:'flex',flexDirection:'column',gap:'2px',fontSize:'11px'}}>{schedStatus.recent_ticks.map((t,i)=><div key={i} style={{display:'flex',gap:'8px'}}><span style={{color:'var(--text-muted)',flexShrink:0}}>{(t.at||'').slice(5,16).replace('T',' ')}</span><span style={{color:t.action==='publish'?'var(--success)':t.action==='draft'?'#F59E0B':'var(--text-dim)'}}>{t.action}</span><span style={{color:'var(--text-dim)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{t.reason}</span></div>)}</div></details>}
             {!schedStatus.linkedin_connected&&<div style={{color:'var(--danger)'}}>LinkedIn not connected — posts would save as scheduled, not publish.</div>}
           </div>
         </div>}</div>

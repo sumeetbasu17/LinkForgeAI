@@ -36,6 +36,13 @@ Say NO for:
 - leadership, culture, mindset, motivation, burnout, or career advice
 - posts whose only "question" is an engagement prompt aimed at the reader
 
+ONE EXCEPTION, and it matters: a post about system design, architecture, or
+object-oriented / low-level design that names components and how data moves
+between them earns a diagram even when the tone is reflective. "Event sourcing
+writes to an event store, projections build read models, the read side lags"
+is a drawable flow, and a reader scrolling past a wall of text will stop for
+the picture. Judge the content, not the mood of the writing.
+
 THE TEST THAT MATTERS — is the question technical or conversational?
 
   "What happens to a payment that's halfway done when the service crashes?"
@@ -58,8 +65,9 @@ Category: {category}
 Format: {format}
 
 Ask yourself in order:
-1. Is there code, config, or a query in this post? -> code-card
-2. Is there a named system or flow with components? -> diagram
+1. Is there a named system, flow, or class structure with components and a
+   direction of travel? -> diagram (this outranks the others for design posts)
+2. Is there code, config, or a query in this post? -> code-card
 3. Does it pose a technical problem with a correct answer? -> social/interview-card
 4. Otherwise -> needs_image is false.
 
@@ -74,10 +82,21 @@ _CODE_SIGNAL = re.compile(
 )
 _FLOW_SIGNAL = re.compile(
     r"->|-->|→|\b(pipeline|architecture|flow|request|queue|broker|consumer|producer|"
-    r"service|gateway|cache|database|endpoint|topic|partition|replica|load balancer)\b",
+    r"service|gateway|cache|database|endpoint|topic|partition|replica|load balancer|"
+    # Event-driven and CQRS vocabulary. A post can describe a whole drawable
+    # system in these words without using any of the ones above.
+    r"event sourcing|event store|event log|projection|read model|write model|"
+    r"command|aggregate|saga|outbox|idempoten\w*|cqrs|stream|snapshot|"
+    # Object and low-level design.
+    r"class|interface|abstract|inheritance|composition|state machine|"
+    r"thread|lock|worker|shard|index|transaction|retry|throttl\w*)\b",
     re.IGNORECASE,
 )
 _QUESTION = re.compile(r"\?")
+
+# Categories where a diagram is the point, not decoration. A reflective post
+# about CQRS still describes a system somebody can draw.
+DESIGN_CATEGORIES = {"system-design", "tech-concepts", "clean-code"}
 
 
 CONTENT_SYSTEM = """You write the text that goes inside a LinkedIn post image.
@@ -175,6 +194,31 @@ def _parse_json(raw) -> dict:
         return {}
 
 
+def infer_archetype(payload: dict) -> str:
+    """Recover the archetype a payload was written for from its shape.
+
+    A payload and its archetype are written together, but they can be sent to
+    the renderer separately (the Editor forwards a saved payload while leaving
+    the archetype blank). Defaulting a blank archetype to "social-card" then
+    renders, say, a diagram payload through the wrong template — the mermaid is
+    dropped and a bare title card comes out. Reading the archetype back off the
+    payload keys keeps the two in step.
+    """
+    if not isinstance(payload, dict) or not payload:
+        return ""
+    if payload.get("mermaid"):
+        return "diagram"
+    if payload.get("code") or payload.get("before_code") or payload.get("after_code"):
+        return "code-card"
+    # interview cards carry a call-to-action / series framing; social cards are
+    # just a body block.
+    if payload.get("cta") or payload.get("series_label") or payload.get("footer_right"):
+        return "interview-card"
+    if payload.get("body") or payload.get("text"):
+        return "social-card"
+    return ""
+
+
 def sanitize_mermaid(source: str) -> str:
     """Make LLM-written Mermaid safe to render.
 
@@ -233,13 +277,36 @@ class VisualAgent:
         reason = str(data.get("reason", ""))[:200]
 
         if needs:
-            veto = self._veto(post, archetype)
+            # A drawable design post is better as a diagram than as a question
+            # card, whichever way the model leaned.
+            if archetype in ("social-card", "interview-card") and self._design_diagram_case(
+                post, category
+            ):
+                archetype = "diagram"
+                reason = "Design post describing a flow — drawn instead of framed"
+            veto = self._veto(post, archetype, category)
             if veto:
                 return {"needs_image": False, "archetype": "", "reason": veto}
+        elif self._design_diagram_case(post, category):
+            # The model leans on tone and calls anything thoughtful a
+            # "reflection". A design post that names components and their flow
+            # is exactly where a diagram earns its place, so overrule the no.
+            return {
+                "needs_image": True,
+                "archetype": "diagram",
+                "reason": "Design post describing a flow — a diagram carries this",
+            }
 
         return {"needs_image": needs, "archetype": archetype, "reason": reason}
 
-    def _veto(self, post: str, archetype: str) -> str:
+    def _design_diagram_case(self, post: str, category: str) -> bool:
+        """True for a design-category post with enough named parts to draw."""
+        if (category or "").strip().lower() not in DESIGN_CATEGORIES:
+            return False
+        hits = {m.group(0).lower() for m in _FLOW_SIGNAL.finditer(post)}
+        return len(hits) >= 3
+
+    def _veto(self, post: str, archetype: str, category: str = "") -> str:
         """Second-guess a yes when the post can't actually fill the card.
 
         The model is the primary judge, but it tends to say yes to anything

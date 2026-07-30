@@ -5,12 +5,19 @@ Two modes:
 1. APScheduler (local dev) — runs inside the FastAPI process, no Redis needed
 2. Celery + Redis (production) — separate worker process, reliable and scalable
 
-The scheduler checks every 30 minutes:
-  - Which users have auto_post_enabled = true?
+Every tick (see TICK_MINUTES) the scheduler asks:
+  - Is auto_post_enabled = true?
   - Is today one of their preferred_days?
-  - Is the current time near their preferred_time?
-  - Have they already posted today?
-  - If all conditions met → generate and publish a post
+  - Are we inside the publishing window — preferred_time plus catch_up_minutes?
+  - Have they already posted today, or is the weekly cap used up?
+
+Inside the window it generates and publishes. Past the window it generates and
+saves a DRAFT: the scheduler runs inside the API process, so a machine asleep at
+09:00 means the first tick of the day can be hours late, and publishing then
+would put a post out at a time the user never picked.
+
+Every tick is written to the scheduler_ticks table. A gap in that history is
+what proves the backend was down, which is the usual cause of a missed slot.
 """
 
 import asyncio
@@ -22,12 +29,19 @@ from db.database import database
 logger = logging.getLogger("scheduler")
 
 
-# How long after the target time a post may still go out. A laptop that was
-# asleep, a server restart, or a missed tick should not silently cost a day's
-# post — but nothing should fire at midnight either.
-CATCH_UP_MINUTES = 240
+# How long after the target time a post may still be PUBLISHED. This scheduler
+# lives inside the FastAPI process, so it only ticks while the backend is up: a
+# sleeping laptop at 9:00 AM means the first tick of the day can land hours
+# late. Publishing then puts a post out at a time the user never chose, so past
+# this window the post is generated and saved as a draft instead.
+# Overridable per user via the catch_up_minutes preference.
+DEFAULT_CATCH_UP_MINUTES = 15
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+# Posts the scheduler creates are prefixed so they can be told apart from
+# hand-generated ones — used by the once-a-day draft guard.
+AUTO_PREFIX = "auto_"
 
 
 def _week_start(now: datetime) -> datetime:
@@ -49,7 +63,12 @@ def _parse_target(preferred_time: str, now: datetime):
 
 
 def evaluate(prefs: dict, now: datetime = None) -> dict:
-    """Decide whether to post right now, and explain why or why not.
+    """Decide what to do right now, and explain why.
+
+    Returns an "action":
+      * "publish" — inside the slot: generate and post to LinkedIn
+      * "draft"   — the slot was missed: generate and save a draft to review
+      * "none"    — do nothing (with a reason)
 
     The scheduler tick and the /api/scheduler/status endpoint both call this,
     so the diagnostic can never drift from what actually happens.
@@ -60,18 +79,25 @@ def evaluate(prefs: dict, now: datetime = None) -> dict:
     preferred_days = prefs.get("preferred_days") or []
     cap = prefs.get("posting_frequency") or 0
     preferred_time = prefs.get("preferred_time", "9:00 AM")
+    window = prefs.get("catch_up_minutes")
+    window = DEFAULT_CATCH_UP_MINUTES if window is None else int(window)
 
     published_this_week = database.count_published_since(
         user_id, _week_start(now).isoformat()
     )
     target = _parse_target(preferred_time, now)
 
-    posted_today = False
-    recent = database.list_posts(user_id=user_id, status="published", limit=1)
-    if recent:
-        posted_today = (recent[0].get("created_at") or "").startswith(
-            now.strftime("%Y-%m-%d")
+    # "Today" is taken from `now` rather than the wall clock so that the status
+    # endpoint and the tests can evaluate any moment consistently.
+    day = now.strftime("%Y-%m-%d")
+    posted_today = database.count_posts_today(user_id, status="published", day=day) > 0
+    drafted_today = (
+        database.count_posts_today(
+            user_id, status="draft", id_prefix=AUTO_PREFIX, day=day
         )
+        > 0
+    )
+    late_minutes = int((now - target).total_seconds() // 60) if target else 0
 
     ctx = {
         "now": now.isoformat(timespec="seconds"),
@@ -79,20 +105,26 @@ def evaluate(prefs: dict, now: datetime = None) -> dict:
         "preferred_days": preferred_days,
         "preferred_time": preferred_time,
         "target_time": target.isoformat(timespec="seconds") if target else None,
-        "catch_up_until": (
-            (target + timedelta(minutes=CATCH_UP_MINUTES)).isoformat(timespec="seconds")
+        "catch_up_minutes": window,
+        "publish_until": (
+            (target + timedelta(minutes=window)).isoformat(timespec="seconds")
             if target
             else None
         ),
+        "late_minutes": max(0, late_minutes),
         "weekly_cap": cap,
         "published_this_week": published_this_week,
         "posted_today": posted_today,
+        "drafted_today": drafted_today,
         "active_categories": prefs.get("active_categories") or [],
         "auto_post_enabled": bool(prefs.get("auto_post_enabled")),
     }
 
+    def decide(action, reason):
+        return {"action": action, "should_post": action != "none", "reason": reason, **ctx}
+
     def no(reason):
-        return {"should_post": False, "reason": reason, **ctx}
+        return decide("none", reason)
 
     if not ctx["auto_post_enabled"]:
         return no("Autonomous mode is off")
@@ -111,13 +143,22 @@ def evaluate(prefs: dict, now: datetime = None) -> dict:
     if now < target:
         mins = int((target - now).total_seconds() // 60)
         return no(f"Too early — {mins} min until {preferred_time}")
-    if now > target + timedelta(minutes=CATCH_UP_MINUTES):
-        return no(
-            f"Missed today's window — {preferred_time} plus "
-            f"{CATCH_UP_MINUTES // 60}h catch-up has passed"
-        )
 
-    return {"should_post": True, "reason": "All conditions met", **ctx}
+    if late_minutes <= window:
+        return decide("publish", f"In the {preferred_time} slot (+{late_minutes} min)")
+
+    # The slot has passed. Never publish hours late behind the user's back —
+    # write one draft for the day and leave the decision to them.
+    if drafted_today:
+        return no(
+            f"Missed the {preferred_time} slot by {late_minutes} min — "
+            "a draft for today is already saved"
+        )
+    return decide(
+        "draft",
+        f"Missed the {preferred_time} slot by {late_minutes} min "
+        f"(window is {window} min) — saving a draft instead of publishing late",
+    )
 
 
 def _should_post_now(prefs: dict) -> bool:
@@ -126,8 +167,12 @@ def _should_post_now(prefs: dict) -> bool:
 
 
 
-async def _generate_and_publish(user_id: str, prefs: dict):
-    """Generate a post and publish it for a user."""
+async def _generate_and_publish(user_id: str, prefs: dict, publish: bool = True):
+    """Generate a post, then publish it or save it as a draft.
+
+    publish=False is the missed-slot path: the post is still written (so the
+    day's material isn't lost) but it waits in Drafts for the user.
+    """
     from agents.graph import generate_post
     from services.linkedin_api import linkedin_service
     import random
@@ -163,7 +208,7 @@ async def _generate_and_publish(user_id: str, prefs: dict):
 
         # Save the post
         import uuid
-        post_id = f"auto_{uuid.uuid4().hex[:12]}"
+        post_id = f"{AUTO_PREFIX}{uuid.uuid4().hex[:12]}"
         database.create_post(
             post_id=post_id,
             title=result.get("final_title", "Auto-generated"),
@@ -176,12 +221,58 @@ async def _generate_and_publish(user_id: str, prefs: dict):
             style_score=result.get("style_score"),
         )
 
-        # If autonomous mode, publish directly
+        # The pipeline's visual step already judged whether this post earns an
+        # image and wrote the card content. Render it here, with the presets and
+        # handles configured in the Images tab. Most posts get nothing — that is
+        # the intended behaviour, a weak card is worse than none.
+        image_path = None
+        if result.get("wants_image") and result.get("image_payload"):
+            try:
+                from services import image_pipeline
+
+                record = await image_pipeline.render_for_post(
+                    archetype=result.get("image_archetype", "social-card"),
+                    payload=result["image_payload"],
+                    user_id=user_id,
+                    post_id=post_id,
+                )
+                image_path = record["path"]
+                logger.info(
+                    f"Rendered {record['archetype']} for {post_id}: {record['url']}"
+                )
+            except Exception as e:
+                logger.warning(f"Image render skipped for {post_id}: {str(e)[:200]}")
+
+        if not publish:
+            logger.info(
+                f"Saved draft {post_id} for {user_id} — outside the publishing window"
+            )
+            return
+
+        # Inside the slot: publish for real.
         if prefs.get("auto_post_enabled"):
             try:
-                pub_result = await linkedin_service.create_text_post(
-                    result.get("final_post", ""), user_id=user_id
-                )
+                text = result.get("final_post", "")
+                pub_result = None
+                if image_path:
+                    # An image post that fails to upload must not cost the post,
+                    # so fall through to text-only.
+                    pub_result = await linkedin_service.create_image_post(
+                        text,
+                        str(image_path),
+                        user_id=user_id,
+                        alt_text=result.get("final_title", ""),
+                    )
+                    if pub_result.get("status") != "published":
+                        logger.warning(
+                            f"Image post failed ({pub_result.get('message')}) — "
+                            "retrying as text only"
+                        )
+                        pub_result = None
+                if pub_result is None:
+                    pub_result = await linkedin_service.create_text_post(
+                        text, user_id=user_id
+                    )
                 if pub_result.get("status") == "published":
                     database.update_post(post_id, status="published")
                     logger.info(f"Auto-published post {post_id} for {user_id}")
@@ -196,7 +287,7 @@ async def _generate_and_publish(user_id: str, prefs: dict):
         logger.error(f"Auto-generation error for {user_id}: {e}")
 
 
-_last_tick: dict = {"at": None, "reason": "Not run yet"}
+_last_tick: dict = {"at": None, "reason": "Not run yet", "action": "none"}
 
 
 def last_tick() -> dict:
@@ -212,10 +303,24 @@ async def run_scheduler_tick():
         decision = evaluate(prefs)
         _last_tick["at"] = datetime.now().isoformat(timespec="seconds")
         _last_tick["reason"] = decision["reason"]
+        _last_tick["action"] = decision["action"]
 
-        if decision["should_post"]:
-            logger.info("Scheduler tick — conditions met, generating post")
-            await _generate_and_publish("default", prefs)
+        # Every tick is logged, so a gap in the history is the proof that the
+        # backend was not running — which is the usual reason a slot is missed.
+        database.record_scheduler_tick(
+            user_id="default",
+            action=decision["action"],
+            reason=decision["reason"],
+            target_time=decision.get("target_time") or "",
+            late_minutes=decision.get("late_minutes") or 0,
+        )
+
+        if decision["action"] == "publish":
+            logger.info("Scheduler tick — in the slot, generating and publishing")
+            await _generate_and_publish("default", prefs, publish=True)
+        elif decision["action"] == "draft":
+            logger.warning(f"Scheduler tick — {decision['reason']}")
+            await _generate_and_publish("default", prefs, publish=False)
         else:
             logger.info(f"Scheduler tick — no post: {decision['reason']}")
     except Exception as e:
@@ -234,16 +339,86 @@ _scheduler = None
 TICK_MINUTES = 10
 
 
+SLOT_JOB_ID = "auto_post_slot"
+TICK_JOB_ID = "auto_post_check"
+
+_CRON_DAYS = {
+    "Mon": "mon", "Tue": "tue", "Wed": "wed", "Thu": "thu",
+    "Fri": "fri", "Sat": "sat", "Sun": "sun",
+}
+
+
+def _next_run(job_id: str):
+    job = _scheduler.get_job(job_id) if _scheduler else None
+    return (
+        job.next_run_time.isoformat(timespec="seconds")
+        if job and job.next_run_time
+        else None
+    )
+
+
 def scheduler_info() -> dict:
-    """Whether the background job is alive and when it next runs."""
+    """Whether the background jobs are alive and when they next run."""
     if not _scheduler:
-        return {"running": False, "next_run": None, "tick_minutes": TICK_MINUTES}
-    job = _scheduler.get_job("auto_post_check")
+        return {
+            "running": False,
+            "next_run": None,
+            "next_slot": None,
+            "tick_minutes": TICK_MINUTES,
+        }
     return {
         "running": bool(_scheduler.running),
-        "next_run": job.next_run_time.isoformat(timespec="seconds") if job and job.next_run_time else None,
+        # The safety-net tick.
+        "next_run": _next_run(TICK_JOB_ID),
+        # The exact-time job — this is the one that fires at 9:00:00 sharp.
+        "next_slot": _next_run(SLOT_JOB_ID),
         "tick_minutes": TICK_MINUTES,
     }
+
+
+def sync_slot_job(user_id: str = "default") -> dict:
+    """(Re)register a cron job that fires exactly at the user's chosen time.
+
+    The 10-minute tick alone means a 9:00 AM post actually goes out somewhere
+    in 9:00–9:10, which is not what the user asked for. This adds a cron
+    trigger on the preferred days at the preferred hour and minute, so the
+    normal case fires on the second. The interval tick stays as the safety net
+    that catches a missed slot and saves a draft.
+
+    Called at startup and again whenever preferences change.
+    """
+    if not _scheduler:
+        return {"scheduled": False, "reason": "Scheduler not running"}
+
+    prefs = database.get_preferences(user_id)
+    days = [_CRON_DAYS[d] for d in (prefs.get("preferred_days") or []) if d in _CRON_DAYS]
+    target = _parse_target(prefs.get("preferred_time", "9:00 AM"), datetime.now())
+
+    existing = _scheduler.get_job(SLOT_JOB_ID)
+    if not days or target is None:
+        if existing:
+            _scheduler.remove_job(SLOT_JOB_ID)
+        return {"scheduled": False, "reason": "No days or unreadable time"}
+
+    from apscheduler.triggers.cron import CronTrigger
+
+    _scheduler.add_job(
+        run_scheduler_tick,
+        CronTrigger(
+            day_of_week=",".join(days), hour=target.hour, minute=target.minute
+        ),
+        id=SLOT_JOB_ID,
+        replace_existing=True,
+        # A few minutes of grace covers a busy event loop, but not a closed app.
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1,
+    )
+    logger.info(
+        f"Slot job set for {prefs.get('preferred_time')} on "
+        f"{','.join(days)} (next: {_next_run(SLOT_JOB_ID)})"
+    )
+    return {"scheduled": True, "next_slot": _next_run(SLOT_JOB_ID)}
 
 
 def start_local_scheduler():
@@ -257,7 +432,7 @@ def start_local_scheduler():
             run_scheduler_tick,
             "interval",
             minutes=TICK_MINUTES,
-            id="auto_post_check",
+            id=TICK_JOB_ID,
             replace_existing=True,
             # Without a grace time APScheduler drops any run it is more than one
             # second late for. A reloading dev server or a sleeping laptop is
@@ -271,9 +446,12 @@ def start_local_scheduler():
             next_run_time=datetime.now() + timedelta(seconds=20),
         )
         _scheduler.start()
+        # Exact-time job for the configured slot; the interval above is only the
+        # net that catches a slot missed because the app was closed.
+        sync_slot_job("default")
         logger.info(
-            f"Local scheduler started (APScheduler, {TICK_MINUTES}-min interval, "
-            f"{TICK_MINUTES}-min misfire grace)"
+            f"Local scheduler started (APScheduler, {TICK_MINUTES}-min safety tick "
+            f"+ exact cron slot)"
         )
     except ImportError:
         logger.warning("APScheduler not installed — scheduler disabled")

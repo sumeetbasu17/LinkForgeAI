@@ -193,9 +193,34 @@ class VectorStore:
         vector = self._simple_embedding(content)
         table = self.db.open_table("user_posts")
 
-        query = table.search(vector).limit(limit + 5)  # over-fetch to filter
+        # Filter inside the search, not after it. Post-filtering a handful of
+        # global nearest neighbours silently starves the smaller group: with
+        # 222 inspiration posts against 71 own posts, a limit-3 "own" query
+        # that over-fetched 8 rows typically came back with one or none, so the
+        # writer got no voice examples at all.
+        conditions = [f"user_id = '{user_id.replace(chr(39), chr(39) * 2)}'"]
+        if post_type:
+            conditions.append(f"post_type = '{post_type}'")
+        if category:
+            conditions.append(f"category = '{category}'")
+        conditions.append("id != 'init'")
+        where = " AND ".join(conditions)
 
-        results = query.to_list()
+        results = []
+        try:
+            results = (
+                table.search(vector)
+                .where(where, prefilter=True)
+                .limit(limit)
+                .to_list()
+            )
+        except Exception:
+            # Older LanceDB builds don't accept prefilter — fall back to a
+            # generous over-fetch and filter in Python.
+            try:
+                results = table.search(vector).limit(max(limit * 40, 200)).to_list()
+            except Exception:
+                return []
 
         # Filter by user_id and optionally by type/category
         filtered = []

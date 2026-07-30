@@ -112,16 +112,6 @@ If an earlier import left posts uncategorized, **Style → Auto-categorize N unc
 backfills them without re-uploading. Fragments from a bad import can't be repaired this
 way — delete and re-import those.
 
-### Writing constraints
-
-`draft_post` forbids inventing the author's experience — no fabricated incidents, metrics,
-employers, or timelines. The only personal experience it may reference is what appears in
-your uploaded posts; everything else is framed as observation or analysis. It also emits no
-markdown, since LinkedIn renders `**bold**` as literal asterisks.
-
-Add your own constraints under **Settings → Custom rules**. A tuned starting point is in
-[`docs/custom-rules.md`](docs/custom-rules.md).
-
 ## Post images
 
 Images are **rendered from HTML templates**, not produced by an image model. Every
@@ -189,7 +179,7 @@ One rule governs both: **Settings are the defaults, an explicit choice wins.**
 | Tone per category | *(none)* | Autonomous mode. In the Generate tab it *prefills* the tone when you pick that category — change it and your choice is used. |
 | Default tone / format | Conversational / story | Both. Autonomous uses them directly; the Generate tab opens on them. |
 | Days | Tue, Thu, Sat | Autonomous mode. These set your cadence. |
-| Time | 9:00 AM | Autonomous mode. A post fires from this time up to 4 hours later. |
+| Time | 9:00 AM | Autonomous mode. A post fires within ±30 min of this. |
 | Weekly cap | 3 | Autonomous mode. A hard ceiling on posts per week, counted Monday–Sunday. |
 | Autonomous mode | off | Master switch for the scheduler. |
 | Custom rules | *(empty)* | Both manual and autonomous generation. |
@@ -204,38 +194,15 @@ schedule quietly posting to your LinkedIn every day.
 
 ### Autonomous mode
 
-A scheduler tick runs every 10 minutes and generates a post when **all** of these hold:
+A scheduler tick runs every 30 minutes and generates a post when **all** of these hold:
+autonomous mode is on, the weekly cap has room, today is a selected day, the current time
+is within 30 minutes of your chosen time, and nothing has been published today. It then
+picks a random active category, applies that category's tone override, generates, and
+publishes to LinkedIn.
 
-1. Autonomous mode is on
-2. At least one active category is selected
-3. Today is a selected day
-4. The weekly cap has room
-5. Nothing has been published today
-6. The current time is at or after your target time, and within the 4-hour catch-up window
-
-It then picks a random active category, applies that category's tone override, generates,
-and publishes to LinkedIn. If LinkedIn isn't connected or publishing fails, the post is
-saved with status `scheduled` rather than lost.
-
-**The catch-up window matters.** A laptop that slept through 9:00 AM, or a server that
-restarted, shouldn't silently cost you the day's post. Anything from the target time until
-four hours later still counts. Past that, the day is skipped.
-
-### Why isn't it posting?
-
-`GET /api/scheduler/status` answers this directly, and the same panel appears under
-**Settings → Autonomous mode**. It reports whether it would post right now and exactly why
-not — wrong day, too early, cap reached, already posted, no categories — plus the posting
-window, the week's count against the cap, whether the background job is alive, and what the
-last tick decided.
-
-It calls the same `evaluate()` the scheduler uses, so the diagnostic can't drift from the
-real behaviour.
-
-**A note on APScheduler:** the job sets `misfire_grace_time` explicitly. The library default
-is one second, so any run it is more than a second late for is dropped silently — which a
-reloading dev server or a sleeping laptop triggers constantly, skipping every tick with only
-a `Run time of job ... was missed by` line to show for it.
+If LinkedIn isn't connected or publishing fails, the post is saved with status `scheduled`
+rather than lost. With no active categories selected, the tick logs a warning and does
+nothing.
 
 ### Generate tab
 

@@ -3,11 +3,12 @@ LangGraph pipeline definition.
 Connects all nodes into the post generation agent graph.
 
 Flow:
-  load_style_context → select_topic → research → draft_post → quality_check
-                                                       ↑                |
-                                                       └── (if revise) ←┘
-                                                                        |
-                                                             decide_visual → END
+  load_style_context → select_topic → refresh_style_context → research
+    → draft_post → quality_check
+          ↑              |
+          └─ (if revise) ┘
+                         |
+              decide_visual → END
 """
 
 from langgraph.graph import StateGraph, END
@@ -15,6 +16,7 @@ from langgraph.graph import StateGraph, END
 from agents.state import PostGenerationState, make_initial_state
 from agents.nodes import (
     load_style_context,
+    refresh_style_context,
     select_topic,
     research,
     draft_post,
@@ -31,6 +33,7 @@ def create_post_generation_graph() -> StateGraph:
 
     # Add nodes
     graph.add_node("load_style_context", load_style_context)
+    graph.add_node("refresh_style_context", refresh_style_context)
     graph.add_node("select_topic", select_topic)
     graph.add_node("research", research)
     graph.add_node("draft_post", draft_post)
@@ -40,7 +43,10 @@ def create_post_generation_graph() -> StateGraph:
     # Define edges (the flow)
     graph.set_entry_point("load_style_context")
     graph.add_edge("load_style_context", "select_topic")
-    graph.add_edge("select_topic", "research")
+    # Re-retrieve the user's own and inspiration posts now that the topic is
+    # known — the first pass could only search on the category.
+    graph.add_edge("select_topic", "refresh_style_context")
+    graph.add_edge("refresh_style_context", "research")
     graph.add_edge("research", "draft_post")
     graph.add_edge("draft_post", "quality_check")
 
